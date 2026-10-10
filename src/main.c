@@ -83,6 +83,89 @@ Picture window_picture;
 
 int wallpaper_width = 0;
 int wallpaper_height = 0;
+
+/* Add more XPM images here; missing paths are skipped automatically. */
+static const char *background_images[] = {
+    "assets/bg.xpm",
+    "assets/bg2.xpm",
+    "assets/bg3.xpm",
+    "assets/bg4.xpm"
+};
+static const size_t background_image_count =
+    sizeof(background_images) / sizeof(background_images[0]);
+static size_t current_background_image = 0;
+
+/* Load an XPM wallpaper and replace the existing wallpaper resources. */
+static int load_wallpaper(const char *path) {
+    Pixmap new_wallpaper = None;
+    Pixmap shape = None;
+    XpmAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+
+    int result = XpmReadFileToPixmap(
+        display, window, (char *)path,
+        &new_wallpaper, &shape, &attributes);
+
+    if (result != XpmSuccess) {
+        XpmFreeAttributes(&attributes);
+        if (new_wallpaper != None) XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    Visual *visual = DefaultVisual(display, DefaultScreen(display));
+    XRenderPictFormat *format = XRenderFindVisualFormat(display, visual);
+
+    if (format == NULL) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    Picture new_picture = XRenderCreatePicture(
+        display, new_wallpaper, format, 0, NULL);
+
+    if (new_picture == None) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    if (window_picture == None) {
+        window_picture = XRenderCreatePicture(
+            display, window, format, 0, NULL);
+    }
+
+    if (wallpaper_picture != None) {
+        XRenderFreePicture(display, wallpaper_picture);
+    }
+    if (wallpaper != None) {
+        XFreePixmap(display, wallpaper);
+    }
+
+    wallpaper = new_wallpaper;
+    wallpaper_picture = new_picture;
+    wallpaper_width = (int)attributes.width;
+    wallpaper_height = (int)attributes.height;
+    XpmFreeAttributes(&attributes);
+    return 0;
+}
+
+/* Cycle forward to the next wallpaper that can be loaded. */
+static int background_image_change(void) {
+    if (background_image_count == 0) return -1;
+
+    for (size_t step = 1; step <= background_image_count; step++) {
+        size_t candidate =
+            (current_background_image + step) % background_image_count;
+
+        if (load_wallpaper(background_images[candidate]) == 0) {
+            current_background_image = candidate;
+            return 0;
+        }
+    }
+
+    return -1;
+}
 MultiWatch watcher = {0};
 Tab tabs[MAX_TABS];
 int tab_count = 1;
@@ -845,6 +928,18 @@ void execute_command(Tab *tab) {
     }
 
     if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "background_image_change") == 0) {
+        if (background_image_change() == 0) {
+            append_output(tab, "Background image changed.\\n");
+        } else {
+            append_output(tab,
+                          "terminator: no other loadable XPM background found\\n");
+            last_status = 1;
+        }
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "clear") == 0) {
         tab->output[0] = '\0';
         last_status = 0;
@@ -929,36 +1024,10 @@ int main(void) {
     wallpaper_picture = None;
     window_picture = None;
 
-    Pixmap shape = None;
-    XpmAttributes xpm_attributes;
-    memset(&xpm_attributes, 0, sizeof(xpm_attributes));
-
-    int xpm_result = XpmReadFileToPixmap(
-        display, window, "assets/bg.xpm",
-        &wallpaper, &shape, &xpm_attributes);
-
-    if (xpm_result == XpmSuccess) {
-        wallpaper_width = (int)xpm_attributes.width;
-        wallpaper_height = (int)xpm_attributes.height;
-
-        Visual *visual = DefaultVisual(display, screen);
-        XRenderPictFormat *format =
-            XRenderFindVisualFormat(display, visual);
-
-        if (format != NULL) {
-            wallpaper_picture = XRenderCreatePicture(
-                display, wallpaper, format, 0, NULL);
-
-            window_picture = XRenderCreatePicture(
-                display, window, format, 0, NULL);
-        } else {
-            fprintf(stderr, "Warning: could not find XRender visual format\n");
-        }
-    } else {
-        fprintf(stderr, "Warning: could not load assets/bg.xpm\n");
+    if (load_wallpaper(background_images[current_background_image]) == -1) {
+        fprintf(stderr, "Warning: could not load initial wallpaper %s\n",
+                background_images[current_background_image]);
     }
-
-    XpmFreeAttributes(&xpm_attributes);
     initialize_tab_cwd(&tabs[0]);
     XMapWindow(display, window);
 
@@ -1025,6 +1094,11 @@ append_output(&tabs[active_tab], "New tab opened.\n\n");
                 }
             } else {
                 running = 0;
+            }
+        } else if (key == XK_F5) {
+            if (background_image_change() == -1) {
+                append_output(&tabs[active_tab],
+                              "terminator: no other loadable XPM background found\\n");
             }
         } else if (key >= XK_F1 && key <= XK_F4) {
             int selected = (int)(key - XK_F1);
