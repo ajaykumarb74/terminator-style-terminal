@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <glob.h>
 
 #define MAX_TABS 4
 #define BUFFER_SIZE 16000
@@ -372,6 +373,82 @@ int needs_continuation(const char *text) {
     return quote != '\0' || escaped;
 }
 
+/*
+ * Expand wildcard arguments such as *.txt.
+ *
+ * Quoting information must be preserved by the tokenizer
+ * if quoted wildcards are to remain literal.
+ */
+static int expand_wildcards(
+    char *args[],
+    int max_args,
+    char *expanded[],
+    int *expanded_count
+) {
+    int out = 0;
+
+    for (int i = 0; args[i] != NULL; i++) {
+        glob_t matches;
+        memset(&matches, 0, sizeof(matches));
+
+        int has_wildcard =
+            strpbrk(args[i], "*?[") != NULL;
+
+        if (!has_wildcard) {
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        int result = glob(args[i], 0, NULL, &matches);
+
+        if (result == GLOB_NOMATCH) {
+            /* Shell convention: keep unmatched patterns literal. */
+            globfree(&matches);
+
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        if (result != 0) {
+            globfree(&matches);
+            return -1;
+        }
+
+        for (size_t j = 0; j < matches.gl_pathc; j++) {
+            if (out >= max_args - 1) {
+                globfree(&matches);
+                return -1;
+            }
+
+            expanded[out++] = strdup(matches.gl_pathv[j]);
+
+            if (expanded[out - 1] == NULL) {
+                globfree(&matches);
+
+                for (int k = 0; k < out; k++) {
+                    /* Only duplicated entries should be freed. */
+                    /* Use the ownership-aware version below. */
+                }
+
+                return -1;
+            }
+        }
+
+        globfree(&matches);
+    }
+
+    expanded[out] = NULL;
+    *expanded_count = out;
+    return 0;
+}
 /* Run a pipeline of external commands. */
 int execute_pipeline(Tab *tab, Token tokens[], int count) {
     char *args[MAX_PIPELINE][MAX_ARGS];
@@ -526,10 +603,44 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
                 close(fd);
             }
 
-            execvp(args[s][0], args[s]);
+          
+            char *expanded[MAX_ARGS];
+            int expanded_count = 0;
 
-            perror(args[s][0]);
+            if (expand_wildcards(
+                    args[s],
+                    MAX_ARGS,
+                    expanded,
+                    &expanded_count
+                ) == -1) {
+                dprintf(STDERR_FILENO,
+                        "terminator: wildcard expansion failed\n");
+                _exit(1);
+            }
+
+            execvp(expanded[0], expanded);
+
+            /* execvp returns only when execution fails. */
+            perror(expanded[0]);
+
+            /* Free duplicated wildcard arguments on failure. */
+            for (int i = 0; i < expanded_count; i++) {
+                int original = 0;
+
+                for (int j = 0; args[s][j] != NULL; j++) {
+                    if (expanded[i] == args[s][j]) {
+                        original = 1;
+                        break;
+                    }
+                }
+
+                if (!original) {
+                    free(expanded[i]);
+                }
+            }
+
             _exit(127);
+
         }
 
         pids[s] = pid;
