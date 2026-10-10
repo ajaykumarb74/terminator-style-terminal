@@ -19,7 +19,7 @@
 #include <glob.h>
 #include <limits.h>
 #define MAX_TABS 4
-#define BUFFER_SIZE 16000
+#define BUFFER_SIZE (1024 * 1024)
 #define INPUT_SIZE 1024
 #define COMMAND_SIZE 4096
 #define HISTORY_SIZE 1000
@@ -58,7 +58,7 @@ typedef struct {
     int continuation;
 
     char cwd[PATH_MAX];
-
+    int scroll_offset;
     char history[HISTORY_SIZE][INPUT_SIZE];
     int history_count;
 } Tab;
