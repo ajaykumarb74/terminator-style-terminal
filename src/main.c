@@ -1,8 +1,12 @@
-
+#include <X11/extensions/Xrender.h>
+#include <X11/xpm.h>
 #include <X11/Xlib.h>
+#include <X11/Xft/Xft.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-
+#include <poll.h>
+#include <signal.h>
+#include <time.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,7 +25,6 @@
 #define MAX_TOKENS 256
 #define MAX_ARGS 64
 #define MAX_PIPELINE 32
-#define LINE_HEIGHT 20
 
 typedef struct {
     char output[BUFFER_SIZE];
@@ -47,17 +50,46 @@ enum {
     TOKEN_INPUT,
     TOKEN_OUTPUT
 };
+#define MAX_WATCH_COMMANDS 8
 
+typedef struct {
+    char command[INPUT_SIZE];
+    pid_t pid;
+    int fd;
+    int active;
+    time_t last_run;
+} WatchCommand;
+
+typedef struct {
+    WatchCommand commands[MAX_WATCH_COMMANDS];
+    int count;
+    int running;
+    Tab *tab;
+} MultiWatch;
 Display *display;
 Window window;
-GC gc;
-XFontStruct *font;
 
+GC gc;
+
+XftFont *xft_font = NULL;
+XftDraw *xft_draw = NULL;
+XftColor col_heading, col_output, col_prompt, col_input;
+Pixmap wallpaper;
+Picture wallpaper_picture;
+Picture window_picture;
+
+int wallpaper_width = 0;
+int wallpaper_height = 0;
+MultiWatch watcher = {0};
 Tab tabs[MAX_TABS];
 int tab_count = 1;
 int active_tab = 0;
 int running = 1;
 int last_status = 0;
+
+/* Font state: line_height follows the currently loaded font. */
+int line_height = 30;
+int font_pixel_size = 0;
 
 void append_output(Tab *tab, const char *text) {
     size_t used = strlen(tab->output);
@@ -160,14 +192,90 @@ int tokenize(const char *command, Token tokens[], int *token_count) {
     return 0;
 }
 
-void draw_window(void) {
-    XClearWindow(display, window);
+/* Open a scalable monospace font sized from the window dimensions. */
+void update_font(int win_w, int win_h) {
+    int size = win_h / 33;        /* 600px tall -> ~18px font */
+    int by_width = win_w / 50;    /* 900px wide -> ~18px font */
 
+    if (by_width < size) size = by_width;
+    if (size < 8) size = 8;
+    if (size > 96) size = 96;
+
+    if (size == font_pixel_size) return;
+
+    char name[64];
+    snprintf(name, sizeof(name), "monospace:pixelsize=%d", size);
+
+    XftFont *new_font = XftFontOpenName(display, DefaultScreen(display), name);
+
+    if (new_font == NULL) return;
+
+    if (xft_font != NULL) XftFontClose(display, xft_font);
+
+    xft_font = new_font;
+    font_pixel_size = size;
+    line_height = xft_font->ascent + xft_font->descent + 8;
+}
+
+static void draw_text(XftColor *color, int x, int y,
+                      const char *text, int length) {
+    if (xft_font == NULL || xft_draw == NULL || length <= 0) return;
+
+    XftDrawStringUtf8(xft_draw, color, xft_font, x, y,
+                      (const FcChar8 *)text, length);
+}
+
+static int text_width(const char *text, int length) {
+    XGlyphInfo extents;
+
+    if (xft_font == NULL || length <= 0) return 0;
+
+    XftTextExtentsUtf8(display, xft_font,
+                       (const FcChar8 *)text, length, &extents);
+    return extents.xOff;
+}
+
+void draw_window(void) {
+    XWindowAttributes attributes;
+    XGetWindowAttributes(display, window, &attributes);
+    /* Draw the wallpaper scaled to the current window size. */
+    if (wallpaper_picture != None &&
+        window_picture != None &&
+        wallpaper_width > 0 &&
+        wallpaper_height > 0 &&
+        attributes.width > 0 &&
+        attributes.height > 0) {
+
+        XTransform transform = {{
+            { XDoubleToFixed((double) wallpaper_width /
+                             attributes.width), 0, 0 },
+            { 0, XDoubleToFixed((double) wallpaper_height /
+                                attributes.height), 0 },
+            { 0, 0, XDoubleToFixed(1.0) }
+        }};
+
+        XRenderSetPictureTransform(
+            display, wallpaper_picture, &transform);
+
+        XRenderSetPictureFilter(
+            display, wallpaper_picture, FilterBilinear,
+            NULL, 0);
+
+        XRenderComposite(
+            display, PictOpSrc,
+            wallpaper_picture, None, window_picture,
+            0, 0, 0, 0, 0, 0,
+            (unsigned int) attributes.width,
+            (unsigned int) attributes.height);
+    } else {
+        XClearWindow(display, window);
+    }
+    /* Tab heading */
     char heading[256] = "";
     char part[64];
 
     for (int i = 0; i < tab_count; i++) {
-        snprintf(part, sizeof(part), " [%d]%s ",
+        snprintf(part, sizeof(part), "  [%d]%s  ",
                  i + 1, i == active_tab ? "*" : "");
 
         if (strlen(heading) + strlen(part) < sizeof(heading) - 1) {
@@ -175,15 +283,12 @@ void draw_window(void) {
         }
     }
 
-    XDrawString(display, window, gc, 10, 22,
+    draw_text(&col_heading, 15, line_height,
                 heading, (int)strlen(heading));
 
     Tab *tab = &tabs[active_tab];
 
-    XWindowAttributes attributes;
-    XGetWindowAttributes(display, window, &attributes);
-
-    int max_lines = (attributes.height - 75) / LINE_HEIGHT;
+    int max_lines = (attributes.height - 3 * line_height) / line_height;
     if (max_lines < 1) max_lines = 1;
 
     char *copy = malloc(strlen(tab->output) + 1);
@@ -191,36 +296,48 @@ void draw_window(void) {
     if (copy != NULL) {
         strcpy(copy, tab->output);
 
+        /* Split on '\n' manually so blank lines are preserved. */
         char *lines[512];
         int count = 0;
-        char *line = strtok(copy, "\n");
+        char *p = copy;
 
-        while (line != NULL && count < 512) {
-            lines[count++] = line;
-            line = strtok(NULL, "\n");
+        while (count < 512) {
+            lines[count++] = p;
+
+            char *newline = strchr(p, '\n');
+            if (newline == NULL) break;
+
+            *newline = '\0';
+            p = newline + 1;
         }
+
+        /* Drop the empty segment after a trailing newline. */
+        if (count > 0 && lines[count - 1][0] == '\0') count--;
 
         int start = count > max_lines ? count - max_lines : 0;
 
         for (int i = start; i < count; i++) {
-            XDrawString(display, window, gc, 10,
-                        48 + (i - start) * LINE_HEIGHT,
+            draw_text(&col_output, 15,
+                        2 * line_height + (i - start) * line_height,
                         lines[i], (int)strlen(lines[i]));
         }
 
         free(copy);
     }
 
-    int prompt_y = attributes.height - 20;
+    /* Command prompt */
+    int prompt_y = attributes.height - line_height / 2;
 
     const char *prompt = tab->continuation
         ? "> "
         : "user@terminator> ";
 
-    XDrawString(display, window, gc, 10, prompt_y,
+    draw_text(&col_prompt, 15, prompt_y,
                 prompt, (int)strlen(prompt));
 
-    XDrawString(display, window, gc, 180, prompt_y,
+    int input_x = 15 + text_width(prompt, (int)strlen(prompt));
+
+    draw_text(&col_input, input_x, prompt_y,
                 tab->input, tab->input_length);
 
     XFlush(display);
@@ -271,7 +388,7 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
             stages++;
 
             if (stages > MAX_PIPELINE) {
-	                append_output(tab, "terminator: too many pipeline stages\n");
+                append_output(tab, "terminator: too many pipeline stages\n");
                 return 2;
             }
         }
@@ -428,21 +545,22 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
 
     char buffer[512];
     ssize_t bytes;
-while ((bytes = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
-    size_t used = strlen(tab->output);
 
-    if (used < BUFFER_SIZE - 1) {
-        size_t available = BUFFER_SIZE - used - 1;
-        size_t amount = (size_t)bytes;
+    while ((bytes = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
+        size_t used = strlen(tab->output);
 
-        if (amount > available) {
-            amount = available;
+        if (used < BUFFER_SIZE - 1) {
+            size_t available = BUFFER_SIZE - used - 1;
+            size_t amount = (size_t)bytes;
+
+            if (amount > available) {
+                amount = available;
+            }
+
+            memcpy(tab->output + used, buffer, amount);
+            tab->output[used + amount] = '\0';
         }
-
-        memcpy(tab->output + used, buffer, amount);
-        tab->output[used + amount] = '\0';
     }
-}
     close(output_pipe[0]);
 
     int result = 0;
@@ -620,11 +738,60 @@ int main(void) {
 
     gc = XCreateGC(display, window, 0, NULL);
 
-    font = XLoadQueryFont(display, "fixed");
+    /* Xft drawing surface and colors. */
+    Visual *xft_visual = DefaultVisual(display, screen);
+    Colormap colormap = DefaultColormap(display, screen);
 
-    if (font != NULL) {
-        XSetFont(display, gc, font->fid);
+    xft_draw = XftDrawCreate(display, window, xft_visual, colormap);
+
+    XftColorAllocName(display, xft_visual, colormap, "#FF4D6D", &col_heading);
+    XftColorAllocName(display, xft_visual, colormap, "#EAF2FF", &col_output);
+    XftColorAllocName(display, xft_visual, colormap, "#7CFF6B", &col_prompt);
+    XftColorAllocName(display, xft_visual, colormap, "#63E6FF", &col_input);
+
+    /* Pick a font that matches the initial window size. */
+    update_font(900, 600);
+
+    if (xft_font == NULL) {
+        fprintf(stderr, "Cannot load a monospace Xft font.\n");
+        return 1;
     }
+
+    /* Load the anime wallpaper. */
+    wallpaper = None;
+    wallpaper_picture = None;
+    window_picture = None;
+
+    Pixmap shape = None;
+    XpmAttributes xpm_attributes;
+    memset(&xpm_attributes, 0, sizeof(xpm_attributes));
+
+    int xpm_result = XpmReadFileToPixmap(
+        display, window, "assets/bg.xpm",
+        &wallpaper, &shape, &xpm_attributes);
+
+    if (xpm_result == XpmSuccess) {
+        wallpaper_width = (int)xpm_attributes.width;
+        wallpaper_height = (int)xpm_attributes.height;
+
+        Visual *visual = DefaultVisual(display, screen);
+        XRenderPictFormat *format =
+            XRenderFindVisualFormat(display, visual);
+
+        if (format != NULL) {
+            wallpaper_picture = XRenderCreatePicture(
+                display, wallpaper, format, 0, NULL);
+
+            window_picture = XRenderCreatePicture(
+                display, window, format, 0, NULL);
+        } else {
+            fprintf(stderr, "Warning: could not find XRender visual format\n");
+        }
+    } else {
+        fprintf(stderr, "Warning: could not load assets/bg.xpm\n");
+    }
+
+    XpmFreeAttributes(&xpm_attributes);
 
     XMapWindow(display, window);
 
@@ -638,21 +805,34 @@ int main(void) {
         XNextEvent(display, &event);
 
         if (event.type == Expose) {
-            draw_window();
+            if (event.xexpose.count == 0) {
+                draw_window();
+            }
+            continue;
         }
 
         if (event.type == DestroyNotify) {
             running = 0;
+            continue;
         }
 
-        if (event.type != KeyPress) continue;
+        if (event.type == ConfigureNotify) {
+            update_font(event.xconfigure.width,
+                        event.xconfigure.height);
+            draw_window();
+            continue;
+        }
+
+        if (event.type != KeyPress) {
+            continue;
+        }
 
         char text[32];
         KeySym key;
         XKeyEvent *key_event = &event.xkey;
 
-        int length = XLookupString(key_event, text,
-                                   sizeof(text), &key, NULL);
+        int length = XLookupString(
+            key_event, text, (int)sizeof(text), &key, NULL);
 
         Tab *tab = &tabs[active_tab];
 
@@ -680,7 +860,9 @@ int main(void) {
             }
         } else if (key >= XK_F1 && key <= XK_F4) {
             int selected = (int)(key - XK_F1);
-            if (selected < tab_count) active_tab = selected;
+            if (selected < tab_count) {
+                active_tab = selected;
+            }
         } else if (key == XK_Return || key == XK_KP_Enter) {
             execute_command(tab);
         } else if (key == XK_BackSpace) {
@@ -702,9 +884,22 @@ int main(void) {
         draw_window();
     }
 
+    if (wallpaper_picture != None) {
+        XRenderFreePicture(display, wallpaper_picture);
+    }
+
+    if (window_picture != None) {
+        XRenderFreePicture(display, window_picture);
+    }
+
+    if (wallpaper != None) {
+        XFreePixmap(display, wallpaper);
+    }
+
     XFreeGC(display, gc);
 
-    if (font != NULL) XFreeFont(display, font);
+    if (xft_font != NULL) XftFontClose(display, xft_font);
+    if (xft_draw != NULL) XftDrawDestroy(xft_draw);
 
     XCloseDisplay(display);
     return 0;
