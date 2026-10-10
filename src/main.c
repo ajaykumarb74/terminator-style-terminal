@@ -418,8 +418,8 @@ void draw_window(void) {
         free(copy);
     }
 
-    /* Command prompt */
-    int prompt_y = attributes.height - line_height / 2;
+    /* Command prompt stays at the top; output is drawn beneath it. */
+    int prompt_y = line_height;
 
     char prompt_buffer[PATH_MAX + 64];
 
