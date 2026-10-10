@@ -17,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <glob.h>
-
+#include <limits.h>
 #define MAX_TABS 4
 #define BUFFER_SIZE 16000
 #define INPUT_SIZE 1024
@@ -26,19 +26,6 @@
 #define MAX_TOKENS 256
 #define MAX_ARGS 64
 #define MAX_PIPELINE 32
-
-typedef struct {
-    char output[BUFFER_SIZE];
-    char input[INPUT_SIZE];
-    int input_length;
-
-    char command[COMMAND_SIZE];
-    int command_length;
-    int continuation;
-
-    char history[HISTORY_SIZE][INPUT_SIZE];
-    int history_count;
-} Tab;
 
 typedef struct {
     char value[INPUT_SIZE];
@@ -60,6 +47,21 @@ typedef struct {
     int active;
     time_t last_run;
 } WatchCommand;
+
+typedef struct {
+    char output[BUFFER_SIZE];
+    char input[INPUT_SIZE];
+    int input_length;
+
+    char command[COMMAND_SIZE];
+    int command_length;
+    int continuation;
+
+    char cwd[PATH_MAX];
+
+    char history[HISTORY_SIZE][INPUT_SIZE];
+    int history_count;
+} Tab;
 
 typedef struct {
     WatchCommand commands[MAX_WATCH_COMMANDS];
@@ -101,6 +103,11 @@ void append_output(Tab *tab, const char *text) {
     strncat(tab->output, text, available);
 }
 
+static void initialize_tab_cwd(Tab *tab) {
+    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
+        snprintf(tab->cwd, sizeof(tab->cwd), "%s", "/");
+    }
+}
 void save_history(Tab *tab, const char *command) {
     if (command[0] == '\0') return;
 
@@ -329,9 +336,16 @@ void draw_window(void) {
     /* Command prompt */
     int prompt_y = attributes.height - line_height / 2;
 
-    const char *prompt = tab->continuation
-        ? "> "
-        : "user@terminator> ";
+    char prompt_buffer[PATH_MAX + 64];
+
+if (tab->continuation) {
+    snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
+} else {
+    snprintf(prompt_buffer, sizeof(prompt_buffer),
+             "user@terminator:%s> ", tab->cwd);
+}
+
+const char *prompt = prompt_buffer;
 
     draw_text(&col_prompt, 15, prompt_y,
                 prompt, (int)strlen(prompt));
@@ -559,6 +573,11 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
         }
 
         if (pid == 0) {
+            if (chdir(tab->cwd) == -1) {
+    dprintf(STDERR_FILENO,
+            "terminator: cannot enter tab directory\n");
+    _exit(1);
+}
             if (previous_read != -1) {
                 dup2(previous_read, STDIN_FILENO);
             }
@@ -693,6 +712,7 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
     return result;
 }
 
+
 void execute_command(Tab *tab) {
     if (tab->input_length == 0) return;
 
@@ -758,20 +778,56 @@ void execute_command(Tab *tab) {
     }
 
     if (!has_pipe && !has_redirect &&
-        strcmp(tokens[0].value, "cd") == 0) {
-        const char *path = count > 1
-            ? tokens[1].value
-            : getenv("HOME");
+    strcmp(tokens[0].value, "cd") == 0) {
 
-        if (path == NULL || chdir(path) == -1) {
-            append_output(tab, "terminator: cd: cannot change directory\n");
-            last_status = 1;
-        } else {
-            last_status = 0;
-        }
+    const char *path = count > 1
+        ? tokens[1].value
+        : getenv("HOME");
 
+    if (path == NULL || path[0] == '\0') {
+        append_output(tab, "terminator: cd: missing directory\n");
+        last_status = 1;
+    } else {
+        char resolved[PATH_MAX];
+
+        if (path[0] == '/') {
+    if (snprintf(resolved, sizeof(resolved), "%s", path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
         goto reset_command;
     }
+} else {
+    if (snprintf(resolved, sizeof(resolved), "%s/%s",
+                 tab->cwd, path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
+        goto reset_command;
+    }
+}
+
+        char *canonical = realpath(resolved, NULL);
+
+        if (canonical == NULL) {
+            append_output(tab,
+                          "terminator: cd: cannot change directory\n");
+            last_status = 1;
+        } else {
+            if (strlen(canonical) >= sizeof(tab->cwd)) {
+                append_output(tab, "terminator: cd: path too long\n");
+                last_status = 1;
+            } else {
+                snprintf(tab->cwd, sizeof(tab->cwd), "%s", canonical);
+                last_status = 0;
+            }
+
+            free(canonical);
+        }
+    }
+
+    goto reset_command;
+}
 
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "history") == 0) {
@@ -903,7 +959,7 @@ int main(void) {
     }
 
     XpmFreeAttributes(&xpm_attributes);
-
+    initialize_tab_cwd(&tabs[0]);
     XMapWindow(display, window);
 
     append_output(&tabs[0],
@@ -951,8 +1007,9 @@ int main(void) {
             (key == XK_t || key == XK_T)) {
             if (tab_count < MAX_TABS) {
                 active_tab = tab_count++;
-                memset(&tabs[active_tab], 0, sizeof(Tab));
-                append_output(&tabs[active_tab], "New tab opened.\n\n");
+memset(&tabs[active_tab], 0, sizeof(Tab));
+initialize_tab_cwd(&tabs[active_tab]);
+append_output(&tabs[active_tab], "New tab opened.\n\n");
             }
         } else if ((key_event->state & ControlMask) &&
                    (key == XK_w || key == XK_W)) {
