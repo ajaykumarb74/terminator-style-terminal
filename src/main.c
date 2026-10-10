@@ -16,28 +16,16 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
+#include <glob.h>
+#include <limits.h>
 #define MAX_TABS 4
-#define BUFFER_SIZE 16000
+#define BUFFER_SIZE (1024 * 1024)
 #define INPUT_SIZE 1024
 #define COMMAND_SIZE 4096
 #define HISTORY_SIZE 1000
 #define MAX_TOKENS 256
 #define MAX_ARGS 64
 #define MAX_PIPELINE 32
-
-typedef struct {
-    char output[BUFFER_SIZE];
-    char input[INPUT_SIZE];
-    int input_length;
-
-    char command[COMMAND_SIZE];
-    int command_length;
-    int continuation;
-
-    char history[HISTORY_SIZE][INPUT_SIZE];
-    int history_count;
-} Tab;
 
 typedef struct {
     char value[INPUT_SIZE];
@@ -59,6 +47,21 @@ typedef struct {
     int active;
     time_t last_run;
 } WatchCommand;
+
+typedef struct {
+    char output[BUFFER_SIZE];
+    char input[INPUT_SIZE];
+    int input_length;
+
+    char command[COMMAND_SIZE];
+    int command_length;
+    int continuation;
+
+    char cwd[PATH_MAX];
+    int scroll_offset;
+    char history[HISTORY_SIZE][INPUT_SIZE];
+    int history_count;
+} Tab;
 
 typedef struct {
     WatchCommand commands[MAX_WATCH_COMMANDS];
@@ -100,6 +103,11 @@ void append_output(Tab *tab, const char *text) {
     strncat(tab->output, text, available);
 }
 
+static void initialize_tab_cwd(Tab *tab) {
+    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
+        snprintf(tab->cwd, sizeof(tab->cwd), "%s", "/");
+    }
+}
 void save_history(Tab *tab, const char *command) {
     if (command[0] == '\0') return;
 
@@ -328,9 +336,16 @@ void draw_window(void) {
     /* Command prompt */
     int prompt_y = attributes.height - line_height / 2;
 
-    const char *prompt = tab->continuation
-        ? "> "
-        : "user@terminator> ";
+    char prompt_buffer[PATH_MAX + 64];
+
+if (tab->continuation) {
+    snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
+} else {
+    snprintf(prompt_buffer, sizeof(prompt_buffer),
+             "user@terminator:%s> ", tab->cwd);
+}
+
+const char *prompt = prompt_buffer;
 
     draw_text(&col_prompt, 15, prompt_y,
                 prompt, (int)strlen(prompt));
@@ -372,6 +387,82 @@ int needs_continuation(const char *text) {
     return quote != '\0' || escaped;
 }
 
+/*
+ * Expand wildcard arguments such as *.txt.
+ *
+ * Quoting information must be preserved by the tokenizer
+ * if quoted wildcards are to remain literal.
+ */
+static int expand_wildcards(
+    char *args[],
+    int max_args,
+    char *expanded[],
+    int *expanded_count
+) {
+    int out = 0;
+
+    for (int i = 0; args[i] != NULL; i++) {
+        glob_t matches;
+        memset(&matches, 0, sizeof(matches));
+
+        int has_wildcard =
+            strpbrk(args[i], "*?[") != NULL;
+
+        if (!has_wildcard) {
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        int result = glob(args[i], 0, NULL, &matches);
+
+        if (result == GLOB_NOMATCH) {
+            /* Shell convention: keep unmatched patterns literal. */
+            globfree(&matches);
+
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        if (result != 0) {
+            globfree(&matches);
+            return -1;
+        }
+
+        for (size_t j = 0; j < matches.gl_pathc; j++) {
+            if (out >= max_args - 1) {
+                globfree(&matches);
+                return -1;
+            }
+
+            expanded[out++] = strdup(matches.gl_pathv[j]);
+
+            if (expanded[out - 1] == NULL) {
+                globfree(&matches);
+
+                for (int k = 0; k < out; k++) {
+                    /* Only duplicated entries should be freed. */
+                    /* Use the ownership-aware version below. */
+                }
+
+                return -1;
+            }
+        }
+
+        globfree(&matches);
+    }
+
+    expanded[out] = NULL;
+    *expanded_count = out;
+    return 0;
+}
 /* Run a pipeline of external commands. */
 int execute_pipeline(Tab *tab, Token tokens[], int count) {
     char *args[MAX_PIPELINE][MAX_ARGS];
@@ -482,6 +573,11 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
         }
 
         if (pid == 0) {
+            if (chdir(tab->cwd) == -1) {
+    dprintf(STDERR_FILENO,
+            "terminator: cannot enter tab directory\n");
+    _exit(1);
+}
             if (previous_read != -1) {
                 dup2(previous_read, STDIN_FILENO);
             }
@@ -526,10 +622,44 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
                 close(fd);
             }
 
-            execvp(args[s][0], args[s]);
+          
+            char *expanded[MAX_ARGS];
+            int expanded_count = 0;
 
-            perror(args[s][0]);
+            if (expand_wildcards(
+                    args[s],
+                    MAX_ARGS,
+                    expanded,
+                    &expanded_count
+                ) == -1) {
+                dprintf(STDERR_FILENO,
+                        "terminator: wildcard expansion failed\n");
+                _exit(1);
+            }
+
+            execvp(expanded[0], expanded);
+
+            /* execvp returns only when execution fails. */
+            perror(expanded[0]);
+
+            /* Free duplicated wildcard arguments on failure. */
+            for (int i = 0; i < expanded_count; i++) {
+                int original = 0;
+
+                for (int j = 0; args[s][j] != NULL; j++) {
+                    if (expanded[i] == args[s][j]) {
+                        original = 1;
+                        break;
+                    }
+                }
+
+                if (!original) {
+                    free(expanded[i]);
+                }
+            }
+
             _exit(127);
+
         }
 
         pids[s] = pid;
@@ -581,6 +711,7 @@ int execute_pipeline(Tab *tab, Token tokens[], int count) {
 
     return result;
 }
+
 
 void execute_command(Tab *tab) {
     if (tab->input_length == 0) return;
@@ -647,20 +778,56 @@ void execute_command(Tab *tab) {
     }
 
     if (!has_pipe && !has_redirect &&
-        strcmp(tokens[0].value, "cd") == 0) {
-        const char *path = count > 1
-            ? tokens[1].value
-            : getenv("HOME");
+    strcmp(tokens[0].value, "cd") == 0) {
 
-        if (path == NULL || chdir(path) == -1) {
-            append_output(tab, "terminator: cd: cannot change directory\n");
-            last_status = 1;
-        } else {
-            last_status = 0;
-        }
+    const char *path = count > 1
+        ? tokens[1].value
+        : getenv("HOME");
 
+    if (path == NULL || path[0] == '\0') {
+        append_output(tab, "terminator: cd: missing directory\n");
+        last_status = 1;
+    } else {
+        char resolved[PATH_MAX];
+
+        if (path[0] == '/') {
+    if (snprintf(resolved, sizeof(resolved), "%s", path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
         goto reset_command;
     }
+} else {
+    if (snprintf(resolved, sizeof(resolved), "%s/%s",
+                 tab->cwd, path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
+        goto reset_command;
+    }
+}
+
+        char *canonical = realpath(resolved, NULL);
+
+        if (canonical == NULL) {
+            append_output(tab,
+                          "terminator: cd: cannot change directory\n");
+            last_status = 1;
+        } else {
+            if (strlen(canonical) >= sizeof(tab->cwd)) {
+                append_output(tab, "terminator: cd: path too long\n");
+                last_status = 1;
+            } else {
+                snprintf(tab->cwd, sizeof(tab->cwd), "%s", canonical);
+                last_status = 0;
+            }
+
+            free(canonical);
+        }
+    }
+
+    goto reset_command;
+}
 
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "history") == 0) {
@@ -792,7 +959,7 @@ int main(void) {
     }
 
     XpmFreeAttributes(&xpm_attributes);
-
+    initialize_tab_cwd(&tabs[0]);
     XMapWindow(display, window);
 
     append_output(&tabs[0],
@@ -840,8 +1007,9 @@ int main(void) {
             (key == XK_t || key == XK_T)) {
             if (tab_count < MAX_TABS) {
                 active_tab = tab_count++;
-                memset(&tabs[active_tab], 0, sizeof(Tab));
-                append_output(&tabs[active_tab], "New tab opened.\n\n");
+memset(&tabs[active_tab], 0, sizeof(Tab));
+initialize_tab_cwd(&tabs[active_tab]);
+append_output(&tabs[active_tab], "New tab opened.\n\n");
             }
         } else if ((key_event->state & ControlMask) &&
                    (key == XK_w || key == XK_W)) {
