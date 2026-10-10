@@ -333,15 +333,12 @@ void draw_window(void) {
     XGetWindowAttributes(display, window, &attributes);
 
     /* Draw the wallpaper scaled to the current window size. */
-    if (wallpaper_picture != None &&
-        window_picture != None &&
-        wallpaper_width > 0 &&
-        wallpaper_height > 0 &&
-        attributes.width > 0 &&
-        attributes.height > 0) {
+    if (wallpaper_picture != None && window_picture != None &&
+        wallpaper_width > 0 && wallpaper_height > 0 &&
+        attributes.width > 0 && attributes.height > 0) {
         XTransform transform = {{
-            { XDoubleToFixed((double) wallpaper_width / attributes.width), 0, 0 },
-            { 0, XDoubleToFixed((double) wallpaper_height / attributes.height), 0 },
+            { XDoubleToFixed((double)wallpaper_width / attributes.width), 0, 0 },
+            { 0, XDoubleToFixed((double)wallpaper_height / attributes.height), 0 },
             { 0, 0, XDoubleToFixed(1.0) }
         }};
         XRenderSetPictureTransform(display, wallpaper_picture, &transform);
@@ -360,42 +357,38 @@ void draw_window(void) {
     for (int i = 0; i < tab_count; i++) {
         snprintf(part, sizeof(part), "  [%d]%s  ",
                  i + 1, i == active_tab ? "*" : "");
-        if (strlen(heading) + strlen(part) < sizeof(heading) - 1) {
+        if (strlen(heading) + strlen(part) < sizeof(heading) - 1)
             strcat(heading, part);
-        }
     }
     draw_text(&col_heading, 15, line_height, heading, (int)strlen(heading));
 
     Tab *tab = &tabs[active_tab];
+    int first_output_y = 2 * line_height;
+    int max_output_rows = (attributes.height - 4 * line_height) / line_height;
+    if (max_output_rows < 1) max_output_rows = 1;
 
-    /* Reserve the bottom row for the prompt and input. */
-    int prompt_y = attributes.height - line_height / 2;
-    int output_first_y = 2 * line_height;
-    int output_rows = (prompt_y - output_first_y - line_height / 2) / line_height;
-    if (output_rows < 1) output_rows = 1;
-
+    /* Render the transcript in order: welcome text, previous prompts,
+       commands, and command output. The editable prompt follows the output. */
     char *copy = malloc(strlen(tab->output) + 1);
+    int displayed_rows = 0;
     if (copy != NULL) {
         strcpy(copy, tab->output);
-        char *lines[512];
+        char *lines[2048];
         int count = 0;
         char *p = copy;
-
-        while (count < 512) {
+        while (count < (int)(sizeof(lines) / sizeof(lines[0]))) {
             lines[count++] = p;
             char *newline = strchr(p, '\n');
             if (newline == NULL) break;
             *newline = '\0';
             p = newline + 1;
         }
-
-        /* Ignore the empty segment after a trailing newline. */
         if (count > 0 && lines[count - 1][0] == '\0') count--;
 
-        int first = count > output_rows ? count - output_rows : 0;
-        int y = output_first_y;
-        for (int i = first; i < count && y < prompt_y - line_height / 2;
-             i++, y += line_height) {
+        int first = count > max_output_rows ? count - max_output_rows : 0;
+        int y = first_output_y;
+        for (int i = first; i < count && displayed_rows < max_output_rows;
+             i++, displayed_rows++, y += line_height) {
             draw_text(&col_output, 15, y, lines[i], (int)strlen(lines[i]));
         }
         free(copy);
@@ -408,12 +401,16 @@ void draw_window(void) {
         snprintf(prompt_buffer, sizeof(prompt_buffer),
                  "user@terminator:%s> ", tab->cwd);
     }
+
+    /* Place the live prompt immediately after the last visible output line. */
+    int prompt_y = first_output_y + displayed_rows * line_height;
+    int bottom_limit = attributes.height - line_height / 2;
+    if (prompt_y > bottom_limit) prompt_y = bottom_limit;
     const char *prompt = prompt_buffer;
     draw_text(&col_prompt, 15, prompt_y, prompt, (int)strlen(prompt));
 
     int input_x = 15 + text_width(prompt, (int)strlen(prompt));
     draw_text(&col_input, input_x, prompt_y, tab->input, tab->input_length);
-
     XFlush(display);
 }
 
