@@ -930,10 +930,10 @@ void execute_command(Tab *tab) {
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "background_image_change") == 0) {
         if (background_image_change() == 0) {
-            append_output(tab, "Background image changed.\\n");
+            append_output(tab, "Background image changed.\n");
         } else {
             append_output(tab,
-                          "terminator: no other loadable XPM background found\\n");
+                          "terminator: no other loadable XPM background found\n");
             last_status = 1;
         }
         goto reset_command;
@@ -1098,7 +1098,7 @@ append_output(&tabs[active_tab], "New tab opened.\n\n");
         } else if (key == XK_F5) {
             if (background_image_change() == -1) {
                 append_output(&tabs[active_tab],
-                              "terminator: no other loadable XPM background found\\n");
+                              "terminator: no other loadable XPM background found\n");
             }
         } else if (key >= XK_F1 && key <= XK_F4) {
             int selected = (int)(key - XK_F1);
