@@ -381,7 +381,7 @@ void draw_window(void) {
 
     Tab *tab = &tabs[active_tab];
 
-    int max_lines = (attributes.height - 3 * line_height) / line_height;
+    int max_lines = (attributes.height - 4 * line_height) / line_height;
     if (max_lines < 1) max_lines = 1;
 
     char *copy = malloc(strlen(tab->output) + 1);
@@ -418,8 +418,8 @@ void draw_window(void) {
         free(copy);
     }
 
-    /* Command prompt stays at the top; output is drawn beneath it. */
-    int prompt_y = line_height;
+    /* Keep the command prompt at the bottom, below the output area. */
+    int prompt_y = attributes.height - line_height / 2;
 
     char prompt_buffer[PATH_MAX + 64];
 
