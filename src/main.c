@@ -331,6 +331,7 @@ static int text_width(const char *text, int length) {
 void draw_window(void) {
     XWindowAttributes attributes;
     XGetWindowAttributes(display, window, &attributes);
+
     /* Draw the wallpaper scaled to the current window size. */
     if (wallpaper_picture != None &&
         window_picture != None &&
@@ -338,85 +339,65 @@ void draw_window(void) {
         wallpaper_height > 0 &&
         attributes.width > 0 &&
         attributes.height > 0) {
-
         XTransform transform = {{
-            { XDoubleToFixed((double) wallpaper_width /
-                             attributes.width), 0, 0 },
-            { 0, XDoubleToFixed((double) wallpaper_height /
-                                attributes.height), 0 },
+            { XDoubleToFixed((double) wallpaper_width / attributes.width), 0, 0 },
+            { 0, XDoubleToFixed((double) wallpaper_height / attributes.height), 0 },
             { 0, 0, XDoubleToFixed(1.0) }
         }};
-
-        XRenderSetPictureTransform(
-            display, wallpaper_picture, &transform);
-
-        XRenderSetPictureFilter(
-            display, wallpaper_picture, FilterBilinear,
-            NULL, 0);
-
-        XRenderComposite(
-            display, PictOpSrc,
-            wallpaper_picture, None, window_picture,
-            0, 0, 0, 0, 0, 0,
-            (unsigned int) attributes.width,
-            (unsigned int) attributes.height);
+        XRenderSetPictureTransform(display, wallpaper_picture, &transform);
+        XRenderSetPictureFilter(display, wallpaper_picture, FilterBilinear, NULL, 0);
+        XRenderComposite(display, PictOpSrc, wallpaper_picture, None,
+                         window_picture, 0, 0, 0, 0, 0, 0,
+                         (unsigned int)attributes.width,
+                         (unsigned int)attributes.height);
     } else {
         XClearWindow(display, window);
     }
-    /* Tab heading */
+
+    /* Tab heading. */
     char heading[256] = "";
     char part[64];
-
     for (int i = 0; i < tab_count; i++) {
         snprintf(part, sizeof(part), "  [%d]%s  ",
                  i + 1, i == active_tab ? "*" : "");
-
         if (strlen(heading) + strlen(part) < sizeof(heading) - 1) {
             strcat(heading, part);
         }
     }
-
-    draw_text(&col_heading, 15, line_height,
-                heading, (int)strlen(heading));
+    draw_text(&col_heading, 15, line_height, heading, (int)strlen(heading));
 
     Tab *tab = &tabs[active_tab];
 
-    /* Keep the prompt/input on the bottom row. Output occupies only the
-       area between the tab heading and that prompt row. */
+    /* Reserve the bottom row for the prompt and input. */
     int prompt_y = attributes.height - line_height / 2;
     int output_first_y = 2 * line_height;
-    int output_rows = (prompt_y - output_first_y - line_height / 2)
-                      / line_height;
+    int output_rows = (prompt_y - output_first_y - line_height / 2) / line_height;
     if (output_rows < 1) output_rows = 1;
 
     char *copy = malloc(strlen(tab->output) + 1);
     if (copy != NULL) {
         strcpy(copy, tab->output);
-
         char *lines[512];
         int count = 0;
         char *p = copy;
 
         while (count < 512) {
             lines[count++] = p;
-            char *newline = strchr(p, '\\n');
+            char *newline = strchr(p, '\n');
             if (newline == NULL) break;
-            *newline = '\\0';
+            *newline = '\0';
             p = newline + 1;
         }
 
         /* Ignore the empty segment after a trailing newline. */
-        if (count > 0 && lines[count - 1][0] == '\\0') count--;
+        if (count > 0 && lines[count - 1][0] == '\0') count--;
 
-        /* Show the most recent output lines without ever drawing over input. */
         int first = count > output_rows ? count - output_rows : 0;
         int y = output_first_y;
         for (int i = first; i < count && y < prompt_y - line_height / 2;
              i++, y += line_height) {
-            draw_text(&col_output, 15, y,
-                      lines[i], (int)strlen(lines[i]));
+            draw_text(&col_output, 15, y, lines[i], (int)strlen(lines[i]));
         }
-
         free(copy);
     }
 
@@ -427,15 +408,15 @@ void draw_window(void) {
         snprintf(prompt_buffer, sizeof(prompt_buffer),
                  "user@terminator:%s> ", tab->cwd);
     }
-
     const char *prompt = prompt_buffer;
     draw_text(&col_prompt, 15, prompt_y, prompt, (int)strlen(prompt));
 
     int input_x = 15 + text_width(prompt, (int)strlen(prompt));
-    draw_text(&col_input, input_x, prompt_y,
-              tab->input, tab->input_length);
+    draw_text(&col_input, input_x, prompt_y, tab->input, tab->input_length);
 
     XFlush(display);
+}
+
 /* Check whether quotes are still open or a line ends in \. */
 int needs_continuation(const char *text) {
     char quote = '\0';
