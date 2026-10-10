@@ -381,68 +381,61 @@ void draw_window(void) {
 
     Tab *tab = &tabs[active_tab];
 
-    int max_lines = (attributes.height - 4 * line_height) / line_height;
-    if (max_lines < 1) max_lines = 1;
+    /* Keep the prompt/input on the bottom row. Output occupies only the
+       area between the tab heading and that prompt row. */
+    int prompt_y = attributes.height - line_height / 2;
+    int output_first_y = 2 * line_height;
+    int output_rows = (prompt_y - output_first_y - line_height / 2)
+                      / line_height;
+    if (output_rows < 1) output_rows = 1;
 
     char *copy = malloc(strlen(tab->output) + 1);
-
     if (copy != NULL) {
         strcpy(copy, tab->output);
 
-        /* Split on '\n' manually so blank lines are preserved. */
         char *lines[512];
         int count = 0;
         char *p = copy;
 
         while (count < 512) {
             lines[count++] = p;
-
-            char *newline = strchr(p, '\n');
+            char *newline = strchr(p, '\\n');
             if (newline == NULL) break;
-
-            *newline = '\0';
+            *newline = '\\0';
             p = newline + 1;
         }
 
-        /* Drop the empty segment after a trailing newline. */
-        if (count > 0 && lines[count - 1][0] == '\0') count--;
+        /* Ignore the empty segment after a trailing newline. */
+        if (count > 0 && lines[count - 1][0] == '\\0') count--;
 
-        int start = count > max_lines ? count - max_lines : 0;
-
-        for (int i = start; i < count; i++) {
-            draw_text(&col_output, 15,
-                        2 * line_height + (i - start) * line_height,
-                        lines[i], (int)strlen(lines[i]));
+        /* Show the most recent output lines without ever drawing over input. */
+        int first = count > output_rows ? count - output_rows : 0;
+        int y = output_first_y;
+        for (int i = first; i < count && y < prompt_y - line_height / 2;
+             i++, y += line_height) {
+            draw_text(&col_output, 15, y,
+                      lines[i], (int)strlen(lines[i]));
         }
 
         free(copy);
     }
 
-    /* Keep the command prompt at the bottom, below the output area. */
-    int prompt_y = attributes.height - line_height / 2;
-
     char prompt_buffer[PATH_MAX + 64];
+    if (tab->continuation) {
+        snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
+    } else {
+        snprintf(prompt_buffer, sizeof(prompt_buffer),
+                 "user@terminator:%s> ", tab->cwd);
+    }
 
-if (tab->continuation) {
-    snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
-} else {
-    snprintf(prompt_buffer, sizeof(prompt_buffer),
-             "user@terminator:%s> ", tab->cwd);
-}
-
-const char *prompt = prompt_buffer;
-
-    draw_text(&col_prompt, 15, prompt_y,
-                prompt, (int)strlen(prompt));
+    const char *prompt = prompt_buffer;
+    draw_text(&col_prompt, 15, prompt_y, prompt, (int)strlen(prompt));
 
     int input_x = 15 + text_width(prompt, (int)strlen(prompt));
-
     draw_text(&col_input, input_x, prompt_y,
-                tab->input, tab->input_length);
+              tab->input, tab->input_length);
 
     XFlush(display);
-}
-
 /* Check whether quotes are still open or a line ends in \. */
 int needs_continuation(const char *text) {
     char quote = '\0';
