@@ -101,6 +101,8 @@ static int load_wallpaper(const char *path) {
     Pixmap shape = None;
     XpmAttributes attributes;
     memset(&attributes, 0, sizeof(attributes));
+    /* Request image dimensions; draw_window() uses them to scale the image. */
+    attributes.valuemask = XpmSize;
 
     int result = XpmReadFileToPixmap(
         display, window, (char *)path,
@@ -930,6 +932,8 @@ void execute_command(Tab *tab) {
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "background_image_change") == 0) {
         if (background_image_change() == 0) {
+            draw_window();
+            XFlush(display);
             append_output(tab, "Background image changed.\n");
         } else {
             append_output(tab,
@@ -1099,6 +1103,9 @@ append_output(&tabs[active_tab], "New tab opened.\n\n");
             if (background_image_change() == -1) {
                 append_output(&tabs[active_tab],
                               "terminator: no other loadable XPM background found\n");
+            } else {
+                draw_window();
+                XFlush(display);
             }
         } else if (key >= XK_F1 && key <= XK_F4) {
             int selected = (int)(key - XK_F1);
