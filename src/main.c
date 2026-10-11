@@ -5,6 +5,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <poll.h>
+#include <stdint.h>
 #include <signal.h>
 #include <time.h>
 #include <ctype.h>
@@ -61,6 +62,11 @@ typedef struct {
     int scroll_offset;
     char history[HISTORY_SIZE][INPUT_SIZE];
     int history_count;
+    pid_t shell_pid;
+    int command_fd;
+    int output_fd;
+    unsigned char ipc_pending[8192];
+    size_t ipc_pending_len;
 } Tab;
 
 typedef struct {
@@ -83,12 +89,102 @@ Picture window_picture;
 
 int wallpaper_width = 0;
 int wallpaper_height = 0;
+
+/* Add more XPM images here; missing paths are skipped automatically. */
+static const char *background_images[] = {
+    "assets/bg.xpm",
+    "assets/bg2.xpm",
+    "assets/bg3.xpm",
+    "assets/bg4.xpm"
+};
+static const size_t background_image_count =
+    sizeof(background_images) / sizeof(background_images[0]);
+static size_t current_background_image = 0;
+
+/* Load an XPM wallpaper and replace the existing wallpaper resources. */
+static int load_wallpaper(const char *path) {
+    Pixmap new_wallpaper = None;
+    Pixmap shape = None;
+    XpmAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    /* Request image dimensions; draw_window() uses them to scale the image. */
+    attributes.valuemask = XpmSize;
+
+    int result = XpmReadFileToPixmap(
+        display, window, (char *)path,
+        &new_wallpaper, &shape, &attributes);
+
+    if (result != XpmSuccess) {
+        XpmFreeAttributes(&attributes);
+        if (new_wallpaper != None) XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    Visual *visual = DefaultVisual(display, DefaultScreen(display));
+    XRenderPictFormat *format = XRenderFindVisualFormat(display, visual);
+
+    if (format == NULL) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    Picture new_picture = XRenderCreatePicture(
+        display, new_wallpaper, format, 0, NULL);
+
+    if (new_picture == None) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    if (window_picture == None) {
+        window_picture = XRenderCreatePicture(
+            display, window, format, 0, NULL);
+    }
+
+    if (use_process_mode) for (int i=0;i<tab_count;i++) stop_process_tab(&tabs[i]);
+
+    if (wallpaper_picture != None) {
+        XRenderFreePicture(display, wallpaper_picture);
+    }
+    if (wallpaper != None) {
+        XFreePixmap(display, wallpaper);
+    }
+
+    wallpaper = new_wallpaper;
+    wallpaper_picture = new_picture;
+    wallpaper_width = (int)attributes.width;
+    wallpaper_height = (int)attributes.height;
+    XpmFreeAttributes(&attributes);
+    return 0;
+}
+
+/* Cycle forward to the next wallpaper that can be loaded. */
+static int background_image_change(void) {
+    if (background_image_count == 0) return -1;
+
+    for (size_t step = 1; step <= background_image_count; step++) {
+        size_t candidate =
+            (current_background_image + step) % background_image_count;
+
+        if (load_wallpaper(background_images[candidate]) == 0) {
+            current_background_image = candidate;
+            return 0;
+        }
+    }
+
+    return -1;
+}
 MultiWatch watcher = {0};
 Tab tabs[MAX_TABS];
 int tab_count = 1;
 int active_tab = 0;
 int running = 1;
 int last_status = 0;
+static int use_process_mode = 0;
+static int process_mode_child = 0;
+void execute_command(Tab *tab);
 
 /* Font state: line_height follows the currently loaded font. */
 int line_height = 30;
@@ -246,119 +342,199 @@ static int text_width(const char *text, int length) {
 void draw_window(void) {
     XWindowAttributes attributes;
     XGetWindowAttributes(display, window, &attributes);
-    /* Draw the wallpaper scaled to the current window size. */
-    if (wallpaper_picture != None &&
-        window_picture != None &&
-        wallpaper_width > 0 &&
-        wallpaper_height > 0 &&
-        attributes.width > 0 &&
-        attributes.height > 0) {
 
+    /* Draw the wallpaper scaled to the current window size. */
+    if (wallpaper_picture != None && window_picture != None &&
+        wallpaper_width > 0 && wallpaper_height > 0 &&
+        attributes.width > 0 && attributes.height > 0) {
         XTransform transform = {{
-            { XDoubleToFixed((double) wallpaper_width /
-                             attributes.width), 0, 0 },
-            { 0, XDoubleToFixed((double) wallpaper_height /
-                                attributes.height), 0 },
+            { XDoubleToFixed((double)wallpaper_width / attributes.width), 0, 0 },
+            { 0, XDoubleToFixed((double)wallpaper_height / attributes.height), 0 },
             { 0, 0, XDoubleToFixed(1.0) }
         }};
-
-        XRenderSetPictureTransform(
-            display, wallpaper_picture, &transform);
-
-        XRenderSetPictureFilter(
-            display, wallpaper_picture, FilterBilinear,
-            NULL, 0);
-
-        XRenderComposite(
-            display, PictOpSrc,
-            wallpaper_picture, None, window_picture,
-            0, 0, 0, 0, 0, 0,
-            (unsigned int) attributes.width,
-            (unsigned int) attributes.height);
+        XRenderSetPictureTransform(display, wallpaper_picture, &transform);
+        XRenderSetPictureFilter(display, wallpaper_picture, FilterBilinear, NULL, 0);
+        XRenderComposite(display, PictOpSrc, wallpaper_picture, None,
+                         window_picture, 0, 0, 0, 0, 0, 0,
+                         (unsigned int)attributes.width,
+                         (unsigned int)attributes.height);
     } else {
         XClearWindow(display, window);
     }
-    /* Tab heading */
+
+    /* Tab heading. */
     char heading[256] = "";
     char part[64];
-
     for (int i = 0; i < tab_count; i++) {
         snprintf(part, sizeof(part), "  [%d]%s  ",
                  i + 1, i == active_tab ? "*" : "");
-
-        if (strlen(heading) + strlen(part) < sizeof(heading) - 1) {
+        if (strlen(heading) + strlen(part) < sizeof(heading) - 1)
             strcat(heading, part);
-        }
     }
-
-    draw_text(&col_heading, 15, line_height,
-                heading, (int)strlen(heading));
+    draw_text(&col_heading, 15, line_height, heading, (int)strlen(heading));
 
     Tab *tab = &tabs[active_tab];
+    int first_output_y = 2 * line_height;
+    int max_output_rows = (attributes.height - 4 * line_height) / line_height;
+    if (max_output_rows < 1) max_output_rows = 1;
 
-    int max_lines = (attributes.height - 3 * line_height) / line_height;
-    if (max_lines < 1) max_lines = 1;
-
+    /* Render the transcript in order: welcome text, previous prompts,
+       commands, and command output. The editable prompt follows the output. */
     char *copy = malloc(strlen(tab->output) + 1);
-
+    int displayed_rows = 0;
     if (copy != NULL) {
         strcpy(copy, tab->output);
-
-        /* Split on '\n' manually so blank lines are preserved. */
-        char *lines[512];
+        char *lines[2048];
         int count = 0;
         char *p = copy;
-
-        while (count < 512) {
+        while (count < (int)(sizeof(lines) / sizeof(lines[0]))) {
             lines[count++] = p;
-
             char *newline = strchr(p, '\n');
             if (newline == NULL) break;
-
             *newline = '\0';
             p = newline + 1;
         }
-
-        /* Drop the empty segment after a trailing newline. */
         if (count > 0 && lines[count - 1][0] == '\0') count--;
 
-        int start = count > max_lines ? count - max_lines : 0;
-
-        for (int i = start; i < count; i++) {
-            draw_text(&col_output, 15,
-                        2 * line_height + (i - start) * line_height,
-                        lines[i], (int)strlen(lines[i]));
+        int first = count > max_output_rows ? count - max_output_rows : 0;
+        int y = first_output_y;
+        for (int i = first; i < count && displayed_rows < max_output_rows;
+             i++, displayed_rows++, y += line_height) {
+            draw_text(&col_output, 15, y, lines[i], (int)strlen(lines[i]));
         }
-
         free(copy);
     }
 
-    /* Command prompt */
-    int prompt_y = attributes.height - line_height / 2;
-
     char prompt_buffer[PATH_MAX + 64];
+    if (tab->continuation) {
+        snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
+    } else {
+        snprintf(prompt_buffer, sizeof(prompt_buffer),
+                 "user@terminator:%s> ", tab->cwd);
+    }
 
-if (tab->continuation) {
-    snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
-} else {
-    snprintf(prompt_buffer, sizeof(prompt_buffer),
-             "user@terminator:%s> ", tab->cwd);
-}
-
-const char *prompt = prompt_buffer;
-
-    draw_text(&col_prompt, 15, prompt_y,
-                prompt, (int)strlen(prompt));
+    /* Place the live prompt immediately after the last visible output line. */
+    int prompt_y = first_output_y + displayed_rows * line_height;
+    int bottom_limit = attributes.height - line_height / 2;
+    if (prompt_y > bottom_limit) prompt_y = bottom_limit;
+    const char *prompt = prompt_buffer;
+    draw_text(&col_prompt, 15, prompt_y, prompt, (int)strlen(prompt));
 
     int input_x = 15 + text_width(prompt, (int)strlen(prompt));
-
-    draw_text(&col_input, input_x, prompt_y,
-                tab->input, tab->input_length);
-
+    draw_text(&col_input, input_x, prompt_y, tab->input, tab->input_length);
     XFlush(display);
 }
 
 /* Check whether quotes are still open or a line ends in \. */
+/* Process-mode IPC: [type][uint32 length][payload]. */
+static int write_all_fd(int fd, const void *data, size_t length) {
+    const unsigned char *p = data;
+    while (length) {
+        ssize_t n = write(fd, p, length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; length -= (size_t)n;
+    }
+    return 0;
+}
+static int send_ipc(int fd, char type, const void *data, uint32_t length) {
+    if (write_all_fd(fd, &type, 1) || write_all_fd(fd, &length, sizeof(length))) return -1;
+    return length ? write_all_fd(fd, data, length) : 0;
+}
+typedef struct { int continuation; char cwd[PATH_MAX]; } TabStatusMessage;
+static int start_process_tab(Tab *tab) {
+    int commands[2] = {-1,-1}, output[2] = {-1,-1};
+    if (pipe(commands) == -1 || pipe(output) == -1) {
+        if (commands[0] >= 0) { close(commands[0]); close(commands[1]); }
+        if (output[0] >= 0) { close(output[0]); close(output[1]); }
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid == -1) { close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); return -1; }
+    if (pid == 0) {
+        close(commands[1]); close(output[0]);
+        for (int i=0; i<tab_count; i++) {
+            if (tabs[i].command_fd >= 0) close(tabs[i].command_fd);
+            if (tabs[i].output_fd >= 0) close(tabs[i].output_fd);
+        }
+        (void)fcntl(commands[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(output[1], F_SETFD, FD_CLOEXEC);
+        process_mode_child = 1; running = 1;
+        Tab shell_tab; memset(&shell_tab, 0, sizeof(shell_tab));
+        snprintf(shell_tab.cwd, sizeof(shell_tab.cwd), "%s", tab->cwd);
+        char line[INPUT_SIZE]; size_t used = 0;
+        for (;;) {
+            char ch; ssize_t n = read(commands[0], &ch, 1);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            if (ch != '\n') { if (used < sizeof(line)-1) line[used++] = ch; continue; }
+            line[used] = '\0';
+            snprintf(shell_tab.input, sizeof(shell_tab.input), "%s", line);
+            shell_tab.input_length = (int)strlen(shell_tab.input);
+            size_t oldlen = strlen(shell_tab.output);
+            execute_command(&shell_tab);
+            size_t newlen = strlen(shell_tab.output);
+            if (newlen < oldlen) { if (send_ipc(output[1], 'C', NULL, 0)) break; oldlen = 0; }
+            for (size_t pos = oldlen; pos < newlen;) {
+                uint32_t amount = (uint32_t)(newlen-pos); if (amount > 2048) amount = 2048;
+                if (send_ipc(output[1], 'O', shell_tab.output+pos, amount)) goto child_done;
+                pos += amount;
+            }
+            TabStatusMessage status; memset(&status, 0, sizeof(status));
+            status.continuation = shell_tab.continuation;
+            snprintf(status.cwd, sizeof(status.cwd), "%s", shell_tab.cwd);
+            if (send_ipc(output[1], 'S', &status, (uint32_t)sizeof(status))) break;
+            used = 0; if (!running) break;
+        }
+child_done:
+        close(commands[0]); close(output[1]); _exit(0);
+    }
+    close(commands[0]); close(output[1]);
+    int flags = fcntl(output[0], F_GETFL, 0);
+    if (flags != -1) (void)fcntl(output[0], F_SETFL, flags | O_NONBLOCK);
+    tab->shell_pid = pid; tab->command_fd = commands[1]; tab->output_fd = output[0]; tab->ipc_pending_len = 0;
+    return 0;
+}
+static void stop_process_tab(Tab *tab) {
+    if (tab->command_fd >= 0) close(tab->command_fd);
+    if (tab->output_fd >= 0) close(tab->output_fd);
+    if (tab->shell_pid > 0) { kill(tab->shell_pid, SIGTERM); while (waitpid(tab->shell_pid, NULL, 0) == -1 && errno == EINTR) {} }
+    tab->command_fd = tab->output_fd = -1; tab->shell_pid = -1;
+}
+static void process_tab_ipc(Tab *tab) {
+    unsigned char incoming[2048];
+    for (;;) {
+        ssize_t n = read(tab->output_fd, incoming, sizeof(incoming));
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0) { close(tab->output_fd); tab->output_fd = -1; break; }
+        if (n < 0) break;
+        size_t room = sizeof(tab->ipc_pending)-tab->ipc_pending_len;
+        size_t amount = (size_t)n < room ? (size_t)n : room;
+        memcpy(tab->ipc_pending+tab->ipc_pending_len, incoming, amount);
+        tab->ipc_pending_len += amount;
+        if (amount < (size_t)n) break;
+    }
+    size_t used = 0;
+    while (tab->ipc_pending_len-used >= 5) {
+        unsigned char *p = tab->ipc_pending+used; char type = (char)p[0]; uint32_t len;
+        memcpy(&len, p+1, sizeof(len));
+        if (len > sizeof(tab->ipc_pending)-5) { tab->ipc_pending_len=0; return; }
+        if (tab->ipc_pending_len-used < 5+(size_t)len) break;
+        const unsigned char *data = p+5;
+        if (type == 'O') {
+            char chunk[2049]; size_t amount = len > 2048 ? 2048 : len;
+            memcpy(chunk,data,amount); chunk[amount]='\0'; append_output(tab,chunk);
+        } else if (type == 'C') tab->output[0]='\0';
+        else if (type == 'S' && len == sizeof(TabStatusMessage)) {
+            TabStatusMessage status; memcpy(&status,data,sizeof(status));
+            tab->continuation=status.continuation; snprintf(tab->cwd,sizeof(tab->cwd),"%s",status.cwd);
+        }
+        used += 5+(size_t)len;
+    }
+    if (used) { memmove(tab->ipc_pending,tab->ipc_pending+used,tab->ipc_pending_len-used); tab->ipc_pending_len-=used; }
+}
+
+
 int needs_continuation(const char *text) {
     char quote = '\0';
     int escaped = 0;
@@ -845,6 +1021,25 @@ void execute_command(Tab *tab) {
     }
 
     if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "background_image_change") == 0) {
+        if (process_mode_child) {
+            append_output(tab, "terminator: background changes are handled by the GUI (use F5)\n");
+            last_status = 1;
+            goto reset_command;
+        }
+        if (background_image_change() == 0) {
+            draw_window();
+            XFlush(display);
+            append_output(tab, "Background image changed.\n");
+        } else {
+            append_output(tab,
+                          "terminator: no other loadable XPM background found\n");
+            last_status = 1;
+        }
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "clear") == 0) {
         tab->output[0] = '\0';
         last_status = 0;
@@ -881,7 +1076,8 @@ clear_input:
     tab->input[0] = '\0';
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    for (int i=1; i<argc; i++) if (strcmp(argv[i], "useProcess=True")==0) use_process_mode=1;
     display = XOpenDisplay(NULL);
 
     if (display == NULL) {
@@ -929,37 +1125,13 @@ int main(void) {
     wallpaper_picture = None;
     window_picture = None;
 
-    Pixmap shape = None;
-    XpmAttributes xpm_attributes;
-    memset(&xpm_attributes, 0, sizeof(xpm_attributes));
-
-    int xpm_result = XpmReadFileToPixmap(
-        display, window, "assets/bg.xpm",
-        &wallpaper, &shape, &xpm_attributes);
-
-    if (xpm_result == XpmSuccess) {
-        wallpaper_width = (int)xpm_attributes.width;
-        wallpaper_height = (int)xpm_attributes.height;
-
-        Visual *visual = DefaultVisual(display, screen);
-        XRenderPictFormat *format =
-            XRenderFindVisualFormat(display, visual);
-
-        if (format != NULL) {
-            wallpaper_picture = XRenderCreatePicture(
-                display, wallpaper, format, 0, NULL);
-
-            window_picture = XRenderCreatePicture(
-                display, window, format, 0, NULL);
-        } else {
-            fprintf(stderr, "Warning: could not find XRender visual format\n");
-        }
-    } else {
-        fprintf(stderr, "Warning: could not load assets/bg.xpm\n");
+    if (load_wallpaper(background_images[current_background_image]) == -1) {
+        fprintf(stderr, "Warning: could not load initial wallpaper %s\n",
+                background_images[current_background_image]);
     }
-
-    XpmFreeAttributes(&xpm_attributes);
     initialize_tab_cwd(&tabs[0]);
+    for (int i=0; i<MAX_TABS; i++) { tabs[i].command_fd=-1; tabs[i].output_fd=-1; tabs[i].shell_pid=-1; }
+    if (use_process_mode && start_process_tab(&tabs[0]) == -1) { fprintf(stderr, "Cannot start tab shell process.\n"); XCloseDisplay(display); return 1; }
     XMapWindow(display, window);
 
     append_output(&tabs[0],
@@ -968,6 +1140,16 @@ int main(void) {
                   "Ctrl+T: new tab; Ctrl+W: close tab; F1-F4: switch\n\n");
 
     while (running) {
+        if (use_process_mode) {
+            struct pollfd fds[MAX_TABS+1]; int map[MAX_TABS+1]; int nfds=1;
+            fds[0].fd=ConnectionNumber(display); fds[0].events=POLLIN; fds[0].revents=0; map[0]=-1;
+            for (int i=0;i<tab_count;i++) if (tabs[i].output_fd>=0) { fds[nfds].fd=tabs[i].output_fd; fds[nfds].events=POLLIN|POLLHUP; fds[nfds].revents=0; map[nfds++]=i; }
+            if (XPending(display)==0) {
+                int pr=poll(fds,(nfds_t)nfds,50);
+                if (pr>0) for (int j=1;j<nfds;j++) if (fds[j].revents&(POLLIN|POLLHUP|POLLERR)) process_tab_ipc(&tabs[map[j]]);
+                if (XPending(display)==0) { draw_window(); continue; }
+            }
+        }
         XEvent event;
         XNextEvent(display, &event);
 
@@ -1007,13 +1189,16 @@ int main(void) {
             (key == XK_t || key == XK_T)) {
             if (tab_count < MAX_TABS) {
                 active_tab = tab_count++;
-memset(&tabs[active_tab], 0, sizeof(Tab));
-initialize_tab_cwd(&tabs[active_tab]);
-append_output(&tabs[active_tab], "New tab opened.\n\n");
+                memset(&tabs[active_tab], 0, sizeof(Tab));
+                tabs[active_tab].command_fd=-1; tabs[active_tab].output_fd=-1; tabs[active_tab].shell_pid=-1;
+                initialize_tab_cwd(&tabs[active_tab]);
+                append_output(&tabs[active_tab], "New tab opened.\n\n");
+                if (use_process_mode && start_process_tab(&tabs[active_tab]) == -1) { tab_count--; active_tab=tab_count-1; append_output(&tabs[active_tab], "terminator: could not start tab process\n"); }
             }
         } else if ((key_event->state & ControlMask) &&
                    (key == XK_w || key == XK_W)) {
             if (tab_count > 1) {
+                if (use_process_mode) stop_process_tab(&tabs[active_tab]);
                 for (int i = active_tab; i < tab_count - 1; i++) {
                     tabs[i] = tabs[i + 1];
                 }
@@ -1026,13 +1211,24 @@ append_output(&tabs[active_tab], "New tab opened.\n\n");
             } else {
                 running = 0;
             }
+        } else if (key == XK_F5) {
+            if (background_image_change() == -1) {
+                append_output(&tabs[active_tab],
+                              "terminator: no other loadable XPM background found\n");
+            } else {
+                draw_window();
+                XFlush(display);
+            }
         } else if (key >= XK_F1 && key <= XK_F4) {
             int selected = (int)(key - XK_F1);
             if (selected < tab_count) {
                 active_tab = selected;
             }
         } else if (key == XK_Return || key == XK_KP_Enter) {
-            execute_command(tab);
+            if (use_process_mode) {
+                if (tab->command_fd >= 0) { char line[INPUT_SIZE+2]; int n=snprintf(line,sizeof(line),"%s\n",tab->input); if (n>0 && write_all_fd(tab->command_fd,line,(size_t)n)==-1) append_output(tab,"terminator: failed to send command to tab process\n"); }
+                tab->input_length=0; tab->input[0]='\0';
+            } else execute_command(tab);
         } else if (key == XK_BackSpace) {
             if (tab->input_length > 0) {
                 tab->input_length--;
