@@ -45,7 +45,13 @@ Optional process mode (one shell-engine child process per tab):
 ./terminator useProcess=True
 ```
 
-In process mode, the GUI polls the X11 connection and tab-output pipes so waiting for a shell command does not block X event handling. Each tab keeps its own working directory and command history. Wallpaper changes remain a GUI action (F5) in this mode.
+Optional thread mode (one shell-engine thread per tab):
+
+```bash
+./terminator useThread=True
+```
+
+Choose one mode per launch; do not combine both options. In either mode, the GUI polls the X11 connection and tab-output pipes so waiting for a shell command does not block X event handling. Each tab keeps its own working directory and command history. Wallpaper changes remain a GUI action (F5) in these modes.
 
 ## Current controls
 
