@@ -467,7 +467,7 @@ static int start_process_tab(Tab *tab) {
         }
         (void)fcntl(commands[0], F_SETFD, FD_CLOEXEC);
         (void)fcntl(output[1], F_SETFD, FD_CLOEXEC);
-        process_mode_child = 1; running = 1;
+        process_mode_child = 1; shell_engine_worker = 1; running = 1;
         Tab shell_tab; memset(&shell_tab, 0, sizeof(shell_tab));
         snprintf(shell_tab.cwd, sizeof(shell_tab.cwd), "%s", tab->cwd);
         char line[INPUT_SIZE]; size_t used = 0;
