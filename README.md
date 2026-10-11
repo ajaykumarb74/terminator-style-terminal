@@ -15,13 +15,14 @@ incrementally.
 - GCC
 - GNU Make
 - Git
-- X11 development library (`libx11-dev`)
+- X11 development libraries (`libx11-dev`, `libxpm-dev`, `libxrender-dev`)
+- Xft/fontconfig development files (`libxft-dev`, `libfontconfig1-dev`, `pkg-config`)
 
 On Ubuntu, install the dependencies using:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git make libx11-dev
+sudo apt install -y build-essential git make libx11-dev libxpm-dev libxrender-dev libxft-dev libfontconfig1-dev pkg-config
 ```
 
 ## Build
@@ -32,9 +33,19 @@ make
 
 ## Run
 
+Default mode (existing behavior):
+
 ```bash
 ./terminator
 ```
+
+Optional process mode (one shell-engine child process per tab):
+
+```bash
+./terminator useProcess=True
+```
+
+In process mode, the GUI polls the X11 connection and tab-output pipes so waiting for a shell command does not block X event handling. Each tab keeps its own working directory and command history. Wallpaper changes remain a GUI action (F5) in this mode.
 
 ## Current controls
 
