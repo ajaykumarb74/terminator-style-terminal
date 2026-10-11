@@ -184,6 +184,7 @@ int running = 1;
 int last_status = 0;
 static int use_process_mode = 0;
 static int process_mode_child = 0;
+void execute_command(Tab *tab);
 
 /* Font state: line_height follows the currently loaded font. */
 int line_height = 30;
