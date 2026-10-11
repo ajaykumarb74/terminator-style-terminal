@@ -394,7 +394,14 @@ void draw_window(void) {
         }
         if (count > 0 && lines[count - 1][0] == '\0') count--;
 
-        int first = count > max_output_rows ? count - max_output_rows : 0;
+        int max_scroll = count > max_output_rows
+            ? count - max_output_rows : 0;
+        if (tab->scroll_offset < 0) tab->scroll_offset = 0;
+        if (tab->scroll_offset > max_scroll)
+            tab->scroll_offset = max_scroll;
+
+        int first = max_scroll - tab->scroll_offset;
+        if (first < 0) first = 0;
         int y = first_output_y;
         for (int i = first; i < count && displayed_rows < max_output_rows;
              i++, displayed_rows++, y += line_height) {
@@ -403,6 +410,7 @@ void draw_window(void) {
         free(copy);
     }
 
+    if (tab->scroll_offset == 0) {
     char prompt_buffer[PATH_MAX + 64];
     if (tab->continuation) {
         snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
@@ -420,6 +428,7 @@ void draw_window(void) {
 
     int input_x = 15 + text_width(prompt, (int)strlen(prompt));
     draw_text(&col_input, input_x, prompt_y, tab->input, tab->input_length);
+    }
     XFlush(display);
 }
 
@@ -1095,7 +1104,8 @@ int main(int argc, char **argv) {
     XStoreName(display, window, "Terminator - Custom Terminal");
 
     XSelectInput(display, window,
-                 ExposureMask | KeyPressMask | StructureNotifyMask);
+                 ExposureMask | KeyPressMask | ButtonPressMask |
+                 StructureNotifyMask);
 
     gc = XCreateGC(display, window, 0, NULL);
 
@@ -1170,6 +1180,18 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        if (event.type == ButtonPress) {
+            if (event.xbutton.button == Button4) {
+                tabs[active_tab].scroll_offset += 3;
+            } else if (event.xbutton.button == Button5) {
+                tabs[active_tab].scroll_offset -= 3;
+            } else {
+                continue;
+            }
+            draw_window();
+            continue;
+        }
+
         if (event.type != KeyPress) {
             continue;
         }
@@ -1223,20 +1245,24 @@ int main(int argc, char **argv) {
                 active_tab = selected;
             }
         } else if (key == XK_Return || key == XK_KP_Enter) {
+            tab->scroll_offset = 0;
             if (use_process_mode) {
                 if (tab->command_fd >= 0) { char line[INPUT_SIZE+2]; int n=snprintf(line,sizeof(line),"%s\n",tab->input); if (n>0 && write_all_fd(tab->command_fd,line,(size_t)n)==-1) append_output(tab,"terminator: failed to send command to tab process\n"); }
                 tab->input_length=0; tab->input[0]='\0';
             } else execute_command(tab);
         } else if (key == XK_BackSpace) {
+            tab->scroll_offset = 0;
             if (tab->input_length > 0) {
                 tab->input_length--;
                 tab->input[tab->input_length] = '\0';
             }
         } else if (key == XK_Escape) {
+            tab->scroll_offset = 0;
             tab->input_length = 0;
             tab->input[0] = '\0';
         } else if (length > 0 &&
                    text[0] >= 32 && text[0] <= 126) {
+            tab->scroll_offset = 0;
             if (tab->input_length < INPUT_SIZE - 1) {
                 tab->input[tab->input_length++] = text[0];
                 tab->input[tab->input_length] = '\0';
