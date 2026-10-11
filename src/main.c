@@ -452,7 +452,14 @@ static int start_process_tab(Tab *tab) {
     pid_t pid = fork();
     if (pid == -1) { close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); return -1; }
     if (pid == 0) {
-        close(commands[1]); close(output[0]); process_mode_child = 1; running = 1;
+        close(commands[1]); close(output[0]);
+        for (int i=0; i<tab_count; i++) {
+            if (tabs[i].command_fd >= 0) close(tabs[i].command_fd);
+            if (tabs[i].output_fd >= 0) close(tabs[i].output_fd);
+        }
+        (void)fcntl(commands[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(output[1], F_SETFD, FD_CLOEXEC);
+        process_mode_child = 1; running = 1;
         Tab shell_tab; memset(&shell_tab, 0, sizeof(shell_tab));
         snprintf(shell_tab.cwd, sizeof(shell_tab.cwd), "%s", tab->cwd);
         char line[INPUT_SIZE]; size_t used = 0;
@@ -499,7 +506,8 @@ static void process_tab_ipc(Tab *tab) {
     for (;;) {
         ssize_t n = read(tab->output_fd, incoming, sizeof(incoming));
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
+        if (n == 0) { close(tab->output_fd); tab->output_fd = -1; break; }
+        if (n < 0) break;
         size_t room = sizeof(tab->ipc_pending)-tab->ipc_pending_len;
         size_t amount = (size_t)n < room ? (size_t)n : room;
         memcpy(tab->ipc_pending+tab->ipc_pending_len, incoming, amount);
