@@ -5,6 +5,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <signal.h>
 #include <time.h>
@@ -63,6 +64,9 @@ typedef struct {
     char history[HISTORY_SIZE][INPUT_SIZE];
     int history_count;
     pid_t shell_pid;
+    pthread_t shell_thread;
+    int thread_started;
+    void *thread_context;
     int command_fd;
     int output_fd;
     unsigned char ipc_pending[8192];
@@ -144,6 +148,7 @@ static int load_wallpaper(const char *path) {
     }
 
     if (use_process_mode) for (int i=0;i<tab_count;i++) stop_process_tab(&tabs[i]);
+    if (use_thread_mode) for (int i=0;i<tab_count;i++) stop_thread_tab(&tabs[i]);
 
     if (wallpaper_picture != None) {
         XRenderFreePicture(display, wallpaper_picture);
@@ -181,9 +186,12 @@ Tab tabs[MAX_TABS];
 int tab_count = 1;
 int active_tab = 0;
 int running = 1;
-int last_status = 0;
+static _Thread_local int last_status = 0;
 static int use_process_mode = 0;
+static int use_thread_mode = 0;
 static int process_mode_child = 0;
+static _Thread_local int shell_engine_worker = 0;
+static _Thread_local int shell_worker_should_exit = 0;
 void execute_command(Tab *tab);
 
 /* Font state: line_height follows the currently loaded font. */
@@ -495,6 +503,91 @@ child_done:
     tab->shell_pid = pid; tab->command_fd = commands[1]; tab->output_fd = output[0]; tab->ipc_pending_len = 0;
     return 0;
 }
+
+typedef struct {
+    int command_read_fd;
+    int output_write_fd;
+    Tab shell_tab;
+} ThreadShellContext;
+
+static void *thread_shell_main(void *arg) {
+    ThreadShellContext *ctx = arg;
+    shell_engine_worker = 1;
+    shell_worker_should_exit = 0;
+    Tab *tab = &ctx->shell_tab;
+    char line[INPUT_SIZE];
+    size_t used = 0;
+    for (;;) {
+        char ch;
+        ssize_t n = read(ctx->command_read_fd, &ch, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        if (ch != '\n') { if (used < sizeof(line)-1) line[used++] = ch; continue; }
+        line[used] = '\0';
+        snprintf(tab->input, sizeof(tab->input), "%s", line);
+        tab->input_length = (int)strlen(tab->input);
+        size_t oldlen = strlen(tab->output);
+        execute_command(tab);
+        size_t newlen = strlen(tab->output);
+        if (newlen < oldlen) {
+            if (send_ipc(ctx->output_write_fd, 'C', NULL, 0)) break;
+            oldlen = 0;
+        }
+        for (size_t pos = oldlen; pos < newlen;) {
+            uint32_t amount = (uint32_t)(newlen-pos);
+            if (amount > 2048) amount = 2048;
+            if (send_ipc(ctx->output_write_fd, 'O', tab->output+pos, amount)) goto thread_done;
+            pos += amount;
+        }
+        TabStatusMessage status;
+        memset(&status, 0, sizeof(status));
+        status.continuation = tab->continuation;
+        snprintf(status.cwd, sizeof(status.cwd), "%s", tab->cwd);
+        if (send_ipc(ctx->output_write_fd, 'S', &status, (uint32_t)sizeof(status))) break;
+        used = 0;
+        if (shell_worker_should_exit) break;
+    }
+thread_done:
+    close(ctx->command_read_fd);
+    close(ctx->output_write_fd);
+    return NULL;
+}
+
+static int start_thread_tab(Tab *tab) {
+    int commands[2] = {-1,-1}, output[2] = {-1,-1};
+    if (pipe(commands) == -1 || pipe(output) == -1) {
+        if (commands[0] >= 0) { close(commands[0]); close(commands[1]); }
+        if (output[0] >= 0) { close(output[0]); close(output[1]); }
+        return -1;
+    }
+    ThreadShellContext *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) { close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); return -1; }
+    ctx->command_read_fd = commands[0];
+    ctx->output_write_fd = output[1];
+    snprintf(ctx->shell_tab.cwd, sizeof(ctx->shell_tab.cwd), "%s", tab->cwd);
+    if (pthread_create(&tab->shell_thread, NULL, thread_shell_main, ctx) != 0) {
+        close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); free(ctx); return -1;
+    }
+    int flags = fcntl(output[0], F_GETFL, 0);
+    if (flags != -1) (void)fcntl(output[0], F_SETFL, flags | O_NONBLOCK);
+    tab->command_fd = commands[1];
+    tab->output_fd = output[0];
+    tab->thread_started = 1;
+    tab->thread_context = ctx;
+    return 0;
+}
+static void stop_thread_tab(Tab *tab) {
+    if (tab->command_fd >= 0) { close(tab->command_fd); tab->command_fd = -1; }
+    if (tab->thread_started) {
+        (void)pthread_join(tab->shell_thread, NULL);
+        tab->thread_started = 0;
+    }
+    if (tab->output_fd >= 0) { close(tab->output_fd); tab->output_fd = -1; }
+    free(tab->thread_context);
+    tab->thread_context = NULL;
+}
+
+
 static void stop_process_tab(Tab *tab) {
     if (tab->command_fd >= 0) close(tab->command_fd);
     if (tab->output_fd >= 0) close(tab->output_fd);
@@ -949,7 +1042,8 @@ void execute_command(Tab *tab) {
 
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "exit") == 0) {
-        running = 0;
+        if (shell_engine_worker) shell_worker_should_exit = 1;
+        else running = 0;
         goto reset_command;
     }
 
@@ -1022,7 +1116,7 @@ void execute_command(Tab *tab) {
 
     if (!has_pipe && !has_redirect &&
         strcmp(tokens[0].value, "background_image_change") == 0) {
-        if (process_mode_child) {
+        if (shell_engine_worker) {
             append_output(tab, "terminator: background changes are handled by the GUI (use F5)\n");
             last_status = 1;
             goto reset_command;
@@ -1077,7 +1171,11 @@ clear_input:
 }
 
 int main(int argc, char **argv) {
-    for (int i=1; i<argc; i++) if (strcmp(argv[i], "useProcess=True")==0) use_process_mode=1;
+    for (int i=1; i<argc; i++) {
+        if (strcmp(argv[i], "useProcess=True")==0) use_process_mode=1;
+        if (strcmp(argv[i], "useThread=True")==0) use_thread_mode=1;
+    }
+    if (use_process_mode && use_thread_mode) { fprintf(stderr, "Choose either useProcess=True or useThread=True, not both.\n"); return 2; }
     display = XOpenDisplay(NULL);
 
     if (display == NULL) {
@@ -1132,6 +1230,7 @@ int main(int argc, char **argv) {
     initialize_tab_cwd(&tabs[0]);
     for (int i=0; i<MAX_TABS; i++) { tabs[i].command_fd=-1; tabs[i].output_fd=-1; tabs[i].shell_pid=-1; }
     if (use_process_mode && start_process_tab(&tabs[0]) == -1) { fprintf(stderr, "Cannot start tab shell process.\n"); XCloseDisplay(display); return 1; }
+    if (use_thread_mode && start_thread_tab(&tabs[0]) == -1) { fprintf(stderr, "Cannot start tab shell thread.\n"); XCloseDisplay(display); return 1; }
     XMapWindow(display, window);
 
     append_output(&tabs[0],
@@ -1140,7 +1239,7 @@ int main(int argc, char **argv) {
                   "Ctrl+T: new tab; Ctrl+W: close tab; F1-F4: switch\n\n");
 
     while (running) {
-        if (use_process_mode) {
+        if (use_process_mode || use_thread_mode) {
             struct pollfd fds[MAX_TABS+1]; int map[MAX_TABS+1]; int nfds=1;
             fds[0].fd=ConnectionNumber(display); fds[0].events=POLLIN; fds[0].revents=0; map[0]=-1;
             for (int i=0;i<tab_count;i++) if (tabs[i].output_fd>=0) { fds[nfds].fd=tabs[i].output_fd; fds[nfds].events=POLLIN|POLLHUP; fds[nfds].revents=0; map[nfds++]=i; }
@@ -1194,11 +1293,13 @@ int main(int argc, char **argv) {
                 initialize_tab_cwd(&tabs[active_tab]);
                 append_output(&tabs[active_tab], "New tab opened.\n\n");
                 if (use_process_mode && start_process_tab(&tabs[active_tab]) == -1) { tab_count--; active_tab=tab_count-1; append_output(&tabs[active_tab], "terminator: could not start tab process\n"); }
+                if (use_thread_mode && start_thread_tab(&tabs[active_tab]) == -1) { tab_count--; active_tab=tab_count-1; append_output(&tabs[active_tab], "terminator: could not start tab thread\n"); }
             }
         } else if ((key_event->state & ControlMask) &&
                    (key == XK_w || key == XK_W)) {
             if (tab_count > 1) {
                 if (use_process_mode) stop_process_tab(&tabs[active_tab]);
+                if (use_thread_mode) stop_thread_tab(&tabs[active_tab]);
                 for (int i = active_tab; i < tab_count - 1; i++) {
                     tabs[i] = tabs[i + 1];
                 }
@@ -1225,8 +1326,8 @@ int main(int argc, char **argv) {
                 active_tab = selected;
             }
         } else if (key == XK_Return || key == XK_KP_Enter) {
-            if (use_process_mode) {
-                if (tab->command_fd >= 0) { char line[INPUT_SIZE+2]; int n=snprintf(line,sizeof(line),"%s\n",tab->input); if (n>0 && write_all_fd(tab->command_fd,line,(size_t)n)==-1) append_output(tab,"terminator: failed to send command to tab process\n"); }
+            if (use_process_mode || use_thread_mode) {
+                if (tab->command_fd >= 0) { char line[INPUT_SIZE+2]; int n=snprintf(line,sizeof(line),"%s\n",tab->input); if (n>0 && write_all_fd(tab->command_fd,line,(size_t)n)==-1) append_output(tab,"terminator: failed to send command to tab worker\n"); }
                 tab->input_length=0; tab->input[0]='\0';
             } else execute_command(tab);
         } else if (key == XK_BackSpace) {
