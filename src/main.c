@@ -143,10 +143,6 @@ static int load_wallpaper(const char *path) {
             display, window, format, 0, NULL);
     }
 
-    if (use_process_mode) {
-        for (int i = 0; i < tab_count; i++) stop_process_tab(&tabs[i]);
-    }
-
     if (wallpaper_picture != None) {
         XRenderFreePicture(display, wallpaper_picture);
     }
@@ -1248,6 +1244,10 @@ int main(int argc, char **argv) {
         }
 
         draw_window();
+    }
+
+    if (use_process_mode) {
+        for (int i = 0; i < tab_count; i++) stop_process_tab(&tabs[i]);
     }
 
     if (wallpaper_picture != None) {
