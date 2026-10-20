@@ -1,78 +1,67 @@
-
 # Terminator: A Custom Terminal
 
-A custom terminal emulator and shell written in C for Linux using X11.
+A Linux terminal-emulator prototype written in C using X11, Xft, POSIX pipes,
+and child processes.
 
-## Project status
+## Build dependencies
 
-Task 1: Initial X11 graphical interface and basic command execution.
-
-This is a work in progress. Advanced shell features will be implemented
-incrementally.
-
-## Dependencies
-
-- GCC
-- GNU Make
-- Git
-- X11 development libraries (`libx11-dev`, `libxpm-dev`, `libxrender-dev`)
-- Xft/fontconfig development files (`libxft-dev`, `libfontconfig1-dev`, `pkg-config`)
-
-On Ubuntu, install the dependencies using:
+On Ubuntu/Mint:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git make libx11-dev libxpm-dev libxrender-dev libxft-dev libfontconfig1-dev pkg-config
+sudo apt install -y build-essential git make libx11-dev libxpm-dev \
+  libxrender-dev libxft-dev libfontconfig1-dev pkg-config
 ```
 
 ## Build
 
 ```bash
+make clean
 make
 ```
 
 ## Run
 
-Default mode (existing behavior):
-
 ```bash
 ./terminator
 ```
 
-Optional process mode (one shell-engine child process per tab):
+The default launch selects thread-backed tab shells. To select process-backed
+tab shells explicitly:
 
 ```bash
 ./terminator useProcess=True
 ```
 
-In process mode, the GUI polls the X11 connection and tab-output pipes so waiting for a shell command does not block X event handling. Each tab keeps its own working directory and command history. Wallpaper changes remain a GUI action (F5) in this mode.
+The GUI owns the X11 connection. In tab-worker modes it polls the X11
+connection and worker-output pipes so command execution in a worker does not
+intentionally block tab switching.
 
 ## Current controls
 
-- Enter: execute a basic command
-- Backspace: delete a character
-- Escape: clear the input
+- Enter: execute a command
+- Backspace: delete the last input character
+- Escape: clear the input line
 - Ctrl+T: open a tab
-- Ctrl+W: close a tab
-- F1-F4: switch tabs
+- Ctrl+W: close the active tab
+- F1–F4: switch tabs
+- F5: cycle the wallpaper
 
-## Planned features
+## Scope and known gaps
 
-- Built-in shell commands
-- Multiline input and quoting
-- Input/output redirection
-- Pipelines
-- multiWatch
-- Configurable keyboard shortcuts
-- Signal handling and job control
-- Shared searchable command history
-- Filename auto-completion
-- Bash-script interpretation
-- Thread mode and process mode
+This branch is an implementation baseline, not a claim of full compliance
+with the CS69201 term-project specification. The following requirements still
+need implementation and testing before the project can be called complete:
 
-## Limitations
+- Process-shared command history with process-shared synchronization
+- Full shell quoting, variable expansion, nested command substitution, and
+  multiline semantics
+- `multiWatch` with concurrent command output and Ctrl+C cancellation
+- Configurable persistent key bindings, cursor editing, history navigation,
+  and X11 selection copy/paste
+- Complete job control (`&`, `jobs`, `fg`, `bg`, Ctrl+C, Ctrl+Z)
+- `source`/script execution and reliable per-tab exit status semantics
+- End-to-end testing of tab isolation, cancellation, pipe/redirection edge
+  cases, and clean shutdown
 
-The current implementation is a prototype. It does not yet implement
-all assignment requirements.
-# terminator-style-terminal
-A custom terminal emulator and shell in C using X11 and POSIX system calls
+Do not treat a successful compile as proof that all project requirements pass.

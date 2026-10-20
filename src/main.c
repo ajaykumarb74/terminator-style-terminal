@@ -1,637 +1,1371 @@
-/* Terminator - minimized. Build: gcc -Wall -o terminator terminator_min.c -lX11 -lXft -lXpm -lXrender
- * Run:   ./terminator            (single process)
- *        ./terminator useProcess=True   (one shell process per tab) */
+#include <X11/extensions/Xrender.h>
+#include <X11/xpm.h>
 #include <X11/Xlib.h>
+#include <X11/Xft/Xft.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-#include <X11/xpm.h>
-#include <X11/Xft/Xft.h>
-#include <X11/extensions/Xrender.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <signal.h>
+#include <time.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
-#include <limits.h>
-#include <signal.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <sys/types.h>
 #include <sys/wait.h>
-
+#include <unistd.h>
+#include <glob.h>
+#include <limits.h>
 #define MAX_TABS 4
-#define BUFSZ (1024 * 1024)
-#define INSZ 1024
-#define CMDSZ 4096
-#define HISTSZ 1000
-#define MAXTOK 256
-#define MAXARG 64
-#define MAXPIPE 32
-#define CHUNK 2048
-
-enum { T_WORD, T_PIPE, T_IN, T_OUT };
-typedef struct { char v[INSZ]; int t; } Token;
+#define BUFFER_SIZE (1024 * 1024)
+#define INPUT_SIZE 1024
+#define COMMAND_SIZE 4096
+#define HISTORY_SIZE 1000
+#define MAX_TOKENS 256
+#define MAX_ARGS 64
+#define MAX_PIPELINE 32
 
 typedef struct {
-    char output[BUFSZ], input[INSZ], command[CMDSZ], cwd[PATH_MAX], history[HISTSZ][INSZ];
-    int in_len, cmd_len, cont, hist_n, cmd_fd, out_fd, scroll; /* scroll = lines above the bottom */
+    char value[INPUT_SIZE];
+    int type;
+} Token;
+
+enum {
+    TOKEN_WORD,
+    TOKEN_PIPE,
+    TOKEN_INPUT,
+    TOKEN_OUTPUT
+};
+#define MAX_WATCH_COMMANDS 8
+
+typedef struct {
+    char command[INPUT_SIZE];
     pid_t pid;
-    unsigned char ipc[8192];
-    size_t ipc_len;
+    int fd;
+    int active;
+    time_t last_run;
+} WatchCommand;
+
+typedef struct {
+    char output[BUFFER_SIZE];
+    char input[INPUT_SIZE];
+    int input_length;
+
+    char command[COMMAND_SIZE];
+    int command_length;
+    int continuation;
+
+    char cwd[PATH_MAX];
+    int scroll_offset;
+    char history[HISTORY_SIZE][INPUT_SIZE];
+    int history_count;
+    pid_t shell_pid;
+    pthread_t shell_thread;
+    int thread_started;
+    void *thread_context;
+    int command_fd;
+    int output_fd;
+    unsigned char ipc_pending[8192];
+    size_t ipc_pending_len;
 } Tab;
-typedef struct { int cont; char cwd[PATH_MAX]; } TabStatus;
 
-static Display *dpy;
-static Window win;
-static XftFont *font;
-static XftDraw *xd;
-static XftColor c_head, c_out, c_prompt, c_in;
-static Pixmap wp;
-static Picture wpic, winpic;
-static int wp_w, wp_h, lh = 30, font_px, page_rows = 20;
-static const char *bgs[] = {"assets/bg.xpm", "assets/bg2.xpm", "assets/bg3.xpm", "assets/bg4.xpm"};
-#define NBG (sizeof bgs / sizeof *bgs)
-static size_t cur_bg;
-static Tab tabs[MAX_TABS];
-static int tab_count = 1, active, running = 1, last_status, proc_mode, proc_child;
+typedef struct {
+    WatchCommand commands[MAX_WATCH_COMMANDS];
+    int count;
+    int running;
+    Tab *tab;
+} MultiWatch;
+Display *display;
+Window window;
 
-/* ---------- small helpers ---------- */
-static void out(Tab *t, const char *s) {
-    size_t u = strlen(t->output);
-    if (u < BUFSZ - 1) strncat(t->output, s, BUFSZ - u - 1);
-}
-static void cl(int fd) { if (fd >= 0) close(fd); }
-static void init_tab(Tab *t) {
-    memset(t, 0, sizeof *t);
-    t->cmd_fd = t->out_fd = t->pid = -1;
-    if (!getcwd(t->cwd, sizeof t->cwd)) strcpy(t->cwd, "/");
-}
-static void save_history(Tab *t, const char *c) {
-    if (!*c) return;
-    if (t->hist_n == HISTSZ) { memmove(t->history, t->history + 1, (HISTSZ - 1) * INSZ); t->hist_n--; }
-    snprintf(t->history[t->hist_n++], INSZ, "%s", c);
-}
+GC gc;
 
-/* ---------- wallpaper ---------- */
+XftFont *xft_font = NULL;
+XftDraw *xft_draw = NULL;
+XftColor col_heading, col_output, col_prompt, col_input;
+Pixmap wallpaper;
+Picture wallpaper_picture;
+Picture window_picture;
+
+int wallpaper_width = 0;
+int wallpaper_height = 0;
+
+/* Add more XPM images here; missing paths are skipped automatically. */
+static const char *background_images[] = {
+    "assets/bg.xpm",
+    "assets/bg2.xpm",
+    "assets/bg3.xpm",
+    "assets/bg4.xpm"
+};
+static const size_t background_image_count =
+    sizeof(background_images) / sizeof(background_images[0]);
+static size_t current_background_image = 0;
+
+/* Load an XPM wallpaper and replace the existing wallpaper resources. */
 static int load_wallpaper(const char *path) {
-    Pixmap np = None, shape = None;
-    XpmAttributes at;
-    memset(&at, 0, sizeof at);
-    at.valuemask = XpmSize;
-    if (XpmReadFileToPixmap(dpy, win, (char *)path, &np, &shape, &at) != XpmSuccess) {
-        XpmFreeAttributes(&at);
-        if (np) XFreePixmap(dpy, np);
+    Pixmap new_wallpaper = None;
+    Pixmap shape = None;
+    XpmAttributes attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    /* Request image dimensions; draw_window() uses them to scale the image. */
+    attributes.valuemask = XpmSize;
+
+    int result = XpmReadFileToPixmap(
+        display, window, (char *)path,
+        &new_wallpaper, &shape, &attributes);
+
+    if (result != XpmSuccess) {
+        XpmFreeAttributes(&attributes);
+        if (new_wallpaper != None) XFreePixmap(display, new_wallpaper);
         return -1;
     }
-    if (shape) XFreePixmap(dpy, shape);
-    XRenderPictFormat *f = XRenderFindVisualFormat(dpy, DefaultVisual(dpy, DefaultScreen(dpy)));
-    Picture p = f ? XRenderCreatePicture(dpy, np, f, 0, NULL) : None;
-    if (!p) { XpmFreeAttributes(&at); XFreePixmap(dpy, np); return -1; }
-    if (!winpic) winpic = XRenderCreatePicture(dpy, win, f, 0, NULL);
-    if (wpic) XRenderFreePicture(dpy, wpic);
-    if (wp) XFreePixmap(dpy, wp);
-    wp = np; wpic = p; wp_w = (int)at.width; wp_h = (int)at.height;
-    XpmFreeAttributes(&at);
+
+    Visual *visual = DefaultVisual(display, DefaultScreen(display));
+    XRenderPictFormat *format = XRenderFindVisualFormat(display, visual);
+
+    if (format == NULL) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    Picture new_picture = XRenderCreatePicture(
+        display, new_wallpaper, format, 0, NULL);
+
+    if (new_picture == None) {
+        XpmFreeAttributes(&attributes);
+        XFreePixmap(display, new_wallpaper);
+        return -1;
+    }
+
+    if (window_picture == None) {
+        window_picture = XRenderCreatePicture(
+            display, window, format, 0, NULL);
+    }
+
+    /* Wallpaper replacement must not stop shell workers or close tab pipes. */
+    if (wallpaper_picture != None) {
+        XRenderFreePicture(display, wallpaper_picture);
+    }
+    if (wallpaper != None) {
+        XFreePixmap(display, wallpaper);
+    }
+
+    wallpaper = new_wallpaper;
+    wallpaper_picture = new_picture;
+    wallpaper_width = (int)attributes.width;
+    wallpaper_height = (int)attributes.height;
+    XpmFreeAttributes(&attributes);
     return 0;
 }
+
+/* Cycle forward to the next wallpaper that can be loaded. */
 static int background_image_change(void) {
-    for (size_t s = 1; s <= NBG; s++) {
-        size_t c = (cur_bg + s) % NBG;
-        if (load_wallpaper(bgs[c]) == 0) { cur_bg = c; return 0; }
+    if (background_image_count == 0) return -1;
+
+    for (size_t step = 1; step <= background_image_count; step++) {
+        size_t candidate =
+            (current_background_image + step) % background_image_count;
+
+        if (load_wallpaper(background_images[candidate]) == 0) {
+            current_background_image = candidate;
+            return 0;
+        }
     }
+
     return -1;
 }
+MultiWatch watcher = {0};
+Tab tabs[MAX_TABS];
+int tab_count = 1;
+int active_tab = 0;
+int running = 1;
+static _Thread_local int last_status = 0;
+static int use_process_mode = 0;
+static int use_thread_mode = 0;
+static int process_mode_child = 0;
+static _Thread_local int shell_engine_worker = 0;
+static _Thread_local int shell_worker_should_exit = 0;
+void execute_command(Tab *tab);
 
-/* ---------- font + drawing ---------- */
-static void update_font(int w, int h) {
-    int size = h / 33, bw = w / 50;
-    if (bw < size) size = bw;
-    if (size < 8) size = 8;
-    if (size > 96) size = 96;
-    if (size == font_px) return;
-    char name[64];
-    snprintf(name, sizeof name, "monospace:pixelsize=%d", size);
-    XftFont *f = XftFontOpenName(dpy, DefaultScreen(dpy), name);
-    if (!f) return;
-    if (font) XftFontClose(dpy, font);
-    font = f; font_px = size;
-    lh = font->ascent + font->descent + 8;
-}
-static void text(XftColor *c, int x, int y, const char *s, int n) {
-    if (font && xd && n > 0) XftDrawStringUtf8(xd, c, font, x, y, (const FcChar8 *)s, n);
-}
-static int twidth(const char *s, int n) {
-    XGlyphInfo e;
-    if (!font || n <= 0) return 0;
-    XftTextExtentsUtf8(dpy, font, (const FcChar8 *)s, n, &e);
-    return e.xOff;
-}
-static void draw_window(void) {
-    XWindowAttributes a;
-    XGetWindowAttributes(dpy, win, &a);
-    if (wpic && winpic && wp_w > 0 && wp_h > 0 && a.width > 0 && a.height > 0) {
-        XTransform m = {{{XDoubleToFixed((double)wp_w / a.width), 0, 0},
-                         {0, XDoubleToFixed((double)wp_h / a.height), 0},
-                         {0, 0, XDoubleToFixed(1.0)}}};
-        XRenderSetPictureTransform(dpy, wpic, &m);
-        XRenderSetPictureFilter(dpy, wpic, FilterBilinear, NULL, 0);
-        XRenderComposite(dpy, PictOpSrc, wpic, None, winpic, 0, 0, 0, 0, 0, 0, a.width, a.height);
-    } else XClearWindow(dpy, win);
+/* Font state: line_height follows the currently loaded font. */
+int line_height = 30;
+int font_pixel_size = 0;
 
-    char head[256] = "", part[64];
-    for (int i = 0; i < tab_count; i++) {
-        snprintf(part, sizeof part, "  [%d]%s  ", i + 1, i == active ? "*" : "");
-        if (strlen(head) + strlen(part) < sizeof head - 1) strcat(head, part);
-    }
-    text(&c_head, 15, lh, head, (int)strlen(head));
+void append_output(Tab *tab, const char *text) {
+    size_t used = strlen(tab->output);
 
-    Tab *t = &tabs[active];
-    int maxrows = (a.height - 4 * lh) / lh, rows = 0, y = 2 * lh;
-    if (maxrows < 1) maxrows = 1;
+    if (used >= BUFFER_SIZE - 1) return;
 
-    /* show the last maxrows lines of the transcript (a trailing '\n' is not an extra line) */
-    const char *o = t->output;
-    size_t e = strlen(o), s;
-    if (e && o[e - 1] == '\n') e--;
-    int total = e ? 1 : 0;
-    for (size_t i = 0; i < e; i++) if (o[i] == '\n') total++;
-    page_rows = maxrows;
-    if (t->scroll > total - maxrows) t->scroll = total - maxrows;
-    if (t->scroll < 0) t->scroll = 0;
-    for (int k = 0; k < t->scroll; k++) {            /* drop k lines from the bottom */
-        while (e > 0 && o[e - 1] != '\n') e--;
-        if (e > 0) e--;
-    }
-    s = e;
-    for (int nl = 0; s > 0; s--)
-        if (o[s - 1] == '\n') { if (nl + 1 >= maxrows) break; nl++; }
-    if (e) {
-        const char *p = o + s, *end = o + e;
-        for (;;) {
-            const char *nl = memchr(p, '\n', (size_t)(end - p));
-            text(&c_out, 15, y, p, (int)((nl ? nl : end) - p));
-            rows++; y += lh;
-            if (!nl) break;
-            p = nl + 1;
-        }
-    }
-
-    if (!t->scroll) {                                /* prompt only when at the bottom */
-        char pr[PATH_MAX + 64];
-        if (t->cont) snprintf(pr, sizeof pr, "> ");
-        else snprintf(pr, sizeof pr, "user@terminator:%s> ", t->cwd);
-        int py = 2 * lh + rows * lh, lim = a.height - lh / 2;
-        if (py > lim) py = lim;
-        text(&c_prompt, 15, py, pr, (int)strlen(pr));
-        text(&c_in, 15 + twidth(pr, (int)strlen(pr)), py, t->input, t->in_len);
-    }
-    XFlush(dpy);
+    size_t available = BUFFER_SIZE - used - 1;
+    strncat(tab->output, text, available);
 }
 
-/* ---------- parsing ---------- */
-/* Split into words honoring quotes/backslashes; |, < and > (at a token start) are their own tokens. */
-static int tokenize(const char *s, Token *tk, int *n) {
-    int c = 0, i = 0;
-    while (s[i]) {
-        while (isspace((unsigned char)s[i])) i++;
-        if (!s[i]) break;
-        if (c >= MAXTOK) return -1;
-        if (strchr("|<>", s[i])) {
-            tk[c].v[0] = s[i]; tk[c].v[1] = 0;
-            tk[c].t = s[i] == '|' ? T_PIPE : s[i] == '<' ? T_IN : T_OUT;
-            c++; i++;
+static void initialize_tab_cwd(Tab *tab) {
+    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
+        snprintf(tab->cwd, sizeof(tab->cwd), "%s", "/");
+    }
+}
+void save_history(Tab *tab, const char *command) {
+    if (command[0] == '\0') return;
+
+    if (tab->history_count < HISTORY_SIZE) {
+        snprintf(tab->history[tab->history_count],
+                 INPUT_SIZE, "%s", command);
+        tab->history_count++;
+    } else {
+        memmove(tab->history, tab->history + 1,
+                (HISTORY_SIZE - 1) * sizeof(tab->history[0]));
+
+        snprintf(tab->history[HISTORY_SIZE - 1],
+                 INPUT_SIZE, "%s", command);
+    }
+}
+
+/*
+ * Split a command into words while respecting single and
+ * double quotes. Recognize |, < and > as separate tokens.
+ *
+ * Return 0 on success and -1 on a syntax/size error.
+ */
+int tokenize(const char *command, Token tokens[], int *token_count) {
+    int count = 0;
+    int i = 0;
+
+    while (command[i] != '\0') {
+        while (isspace((unsigned char)command[i])) i++;
+
+        if (command[i] == '\0') break;
+
+        if (count >= MAX_TOKENS) return -1;
+
+        if (command[i] == '|' ||
+            command[i] == '<' ||
+            command[i] == '>') {
+            tokens[count].value[0] = command[i];
+            tokens[count].value[1] = '\0';
+
+            if (command[i] == '|') tokens[count].type = TOKEN_PIPE;
+            if (command[i] == '<') tokens[count].type = TOKEN_INPUT;
+            if (command[i] == '>') tokens[count].type = TOKEN_OUTPUT;
+
+            count++;
+            i++;
             continue;
         }
+
         int j = 0;
-        char q = 0;
-        while (s[i]) {
-            char ch = s[i];
-            if (!q && isspace((unsigned char)ch)) break;
-            if (!q && (ch == '\'' || ch == '"')) { q = ch; i++; continue; }
-            if (q && ch == q) { q = 0; i++; continue; }
-            if (ch == '\\' && q != '\'') { if (!s[i + 1]) return -1; ch = s[++i]; }
-            if (j >= INSZ - 1) return -1;
-            tk[c].v[j++] = ch; i++;
-        }
-        if (q) return -1;
-        tk[c].v[j] = 0; tk[c].t = T_WORD; c++;
-    }
-    *n = c;
-    return 0;
-}
-/* Open quote or trailing backslash => the command continues on the next line. */
-static int needs_continuation(const char *s) {
-    char q = 0;
-    int esc = 0;
-    for (; *s; s++) {
-        if (esc) { esc = 0; continue; }
-        if (*s == '\\' && q != '\'') { esc = 1; continue; }
-        if (!q && (*s == '\'' || *s == '"')) q = *s;
-        else if (q && *s == q) q = 0;
-    }
-    return q || esc;
-}
-/* Expand *, ?, [ via glob(); unmatched patterns stay literal. Runs in a child that execs, so no frees. */
-static int expand_wildcards(char **a, char **o) {
-    int n = 0;
-    for (; *a; a++) {
-        glob_t g;
-        memset(&g, 0, sizeof g);
-        int r = strpbrk(*a, "*?[") ? glob(*a, 0, NULL, &g) : GLOB_NOMATCH;
-        if (r && r != GLOB_NOMATCH) { globfree(&g); return -1; }
-        if (r) { if (n >= MAXARG - 1) return -1; o[n++] = *a; }
-        else for (size_t j = 0; j < g.gl_pathc; j++) {
-            if (n >= MAXARG - 1 || !(o[n] = strdup(g.gl_pathv[j]))) { globfree(&g); return -1; }
-            n++;
-        }
-        globfree(&g);
-    }
-    o[n] = NULL;
-    return 0;
-}
+        char quote = '\0';
 
-/* ---------- pipelines ---------- */
-static int execute_pipeline(Tab *t, Token *tk, int n) {
-    char *args[MAXPIPE][MAXARG], *inf[MAXPIPE] = {0}, *outf[MAXPIPE] = {0};
-    int ac[MAXPIPE] = {0}, stages = 1, s = 0;
+        while (command[i] != '\0') {
+            char c = command[i];
 
-    for (int i = 0; i < n; i++)
-        if (tk[i].t == T_PIPE && ++stages > MAXPIPE) { out(t, "terminator: too many pipeline stages\n"); return 2; }
-    for (int i = 0; i < n; i++) {
-        if (tk[i].t == T_PIPE) {
-            if (!ac[s]) { out(t, "terminator: empty pipeline stage\n"); return 2; }
-            s++;
-        } else if (tk[i].t == T_IN || tk[i].t == T_OUT) {
-            if (i + 1 >= n || tk[i + 1].t != T_WORD) { out(t, "terminator: missing redirection filename\n"); return 2; }
-            (tk[i].t == T_IN ? inf : outf)[s] = tk[i + 1].v;
+            if (quote == '\0' && isspace((unsigned char)c)) break;
+
+            if (quote == '\0' && (c == '\'' || c == '"')) {
+                quote = c;
+                i++;
+                continue;
+            }
+
+            if (quote != '\0' && c == quote) {
+                quote = '\0';
+                i++;
+                continue;
+            }
+
+            if (c == '\\' && quote != '\'') {
+                if (command[i + 1] == '\0') return -1;
+
+                i++;
+                c = command[i];
+            }
+
+            if (j >= INPUT_SIZE - 1) return -1;
+
+            tokens[count].value[j++] = c;
             i++;
-        } else {
-            if (ac[s] >= MAXARG - 1) { out(t, "terminator: too many arguments\n"); return 2; }
-            args[s][ac[s]++] = tk[i].v;
         }
+
+        if (quote != '\0') return -1;
+
+        tokens[count].value[j] = '\0';
+        tokens[count].type = TOKEN_WORD;
+        count++;
     }
-    if (!ac[s]) { out(t, "terminator: empty command\n"); return 2; }
-    for (int i = 0; i < stages; i++) args[i][ac[i]] = NULL;
 
-    int op[2], prev = -1;
-    pid_t pids[MAXPIPE];
-    if (pipe(op) == -1) { out(t, "terminator: pipe failed\n"); return 1; }
-
-    for (s = 0; s < stages; s++) {
-        int np[2] = {-1, -1};
-        pid_t pid = -1;
-        const char *why = NULL;
-        if (s < stages - 1 && pipe(np) == -1) why = "pipe";
-        else if ((pid = fork()) == -1) why = "fork";
-        if (why) {
-            out(t, "terminator: "); out(t, why); out(t, " failed\n");
-            cl(prev); cl(np[0]); cl(np[1]); cl(op[0]); cl(op[1]);
-            return 1;
-        }
-        if (pid == 0) {
-            if (chdir(t->cwd) == -1) { dprintf(STDERR_FILENO, "terminator: cannot enter tab directory\n"); _exit(1); }
-            if (prev != -1) dup2(prev, STDIN_FILENO);
-            dup2(s < stages - 1 ? np[1] : op[1], STDOUT_FILENO);
-            dup2(op[1], STDERR_FILENO);
-            cl(prev); cl(np[0]); cl(np[1]); cl(op[0]); cl(op[1]);
-            if (inf[s]) {
-                int fd = open(inf[s], O_RDONLY);
-                if (fd == -1) { perror(inf[s]); _exit(1); }
-                dup2(fd, STDIN_FILENO); close(fd);
-            }
-            if (outf[s]) {
-                int fd = open(outf[s], O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd == -1) { perror(outf[s]); _exit(1); }
-                dup2(fd, STDOUT_FILENO); close(fd);
-            }
-            char *ex[MAXARG];
-            if (expand_wildcards(args[s], ex) == -1) { dprintf(STDERR_FILENO, "terminator: wildcard expansion failed\n"); _exit(1); }
-            execvp(ex[0], ex);
-            perror(ex[0]);
-            _exit(127);
-        }
-        pids[s] = pid;
-        cl(prev); cl(np[1]);
-        prev = np[0];
-    }
-    cl(prev); close(op[1]);
-
-    char b[CHUNK / 4 + 1];
-    ssize_t r;
-    while ((r = read(op[0], b, sizeof b - 1)) > 0) { b[r] = 0; out(t, b); }
-    close(op[0]);
-
-    int res = 0;
-    for (s = 0; s < stages; s++) {
-        int st;
-        if (waitpid(pids[s], &st, 0) == -1) res = 1;
-        else if (s == stages - 1) res = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
-    }
-    return res;
+    *token_count = count;
+    return 0;
 }
 
-/* ---------- command execution ---------- */
-static void run_command(Tab *t) {
-    Token tk[MAXTOK];
-    int n = 0, simple = 1;
-    if (tokenize(t->command, tk, &n) == -1) { out(t, "terminator: invalid or incomplete command\n"); last_status = 2; return; }
-    if (!n) return;
-    for (int i = 0; i < n; i++) if (tk[i].t != T_WORD) simple = 0;
-    const char *cmd = tk[0].v;
+/* Open a scalable monospace font sized from the window dimensions. */
+void update_font(int win_w, int win_h) {
+    int size = win_h / 33;        /* 600px tall -> ~18px font */
+    int by_width = win_w / 50;    /* 900px wide -> ~18px font */
 
-    if (!simple) { last_status = execute_pipeline(t, tk, n); return; }
+    if (by_width < size) size = by_width;
+    if (size < 8) size = 8;
+    if (size > 96) size = 96;
 
-    if (!strcmp(cmd, "exit")) { running = 0; return; }
-    if (!strcmp(cmd, "clear")) { t->output[0] = 0; last_status = 0; return; }
+    if (size == font_pixel_size) return;
 
-    if (!strcmp(cmd, "cd")) {
-        const char *p = n > 1 ? tk[1].v : getenv("HOME");
-        if (!p || !*p) { out(t, "terminator: cd: missing directory\n"); last_status = 1; return; }
-        char res[PATH_MAX];
-        int w = p[0] == '/' ? snprintf(res, sizeof res, "%s", p) : snprintf(res, sizeof res, "%s/%s", t->cwd, p);
-        char *c = w < (int)sizeof res ? realpath(res, NULL) : NULL;
-        int ok = 0;
-        if (w >= (int)sizeof res || (c && strlen(c) >= sizeof t->cwd)) out(t, "terminator: cd: path too long\n");
-        else if (!c) out(t, "terminator: cd: cannot change directory\n");
-        else { snprintf(t->cwd, sizeof t->cwd, "%s", c); ok = 1; }
-        free(c);
-        last_status = !ok;
-        return;
-    }
-    if (!strcmp(cmd, "history")) {
-        char s[INSZ + 32];
-        for (int i = 0; i < t->hist_n; i++) { snprintf(s, sizeof s, "%4d  %s\n", i + 1, t->history[i]); out(t, s); }
-        last_status = 0;
-        return;
-    }
-    if (!strcmp(cmd, "background_image_change")) {
-        if (proc_child) { out(t, "terminator: background changes are handled by the GUI (use F5)\n"); last_status = 1; }
-        else if (background_image_change() == 0) { draw_window(); out(t, "Background image changed.\n"); }
-        else { out(t, "terminator: no other loadable XPM background found\n"); last_status = 1; }
-        return;
-    }
-    if (!strcmp(cmd, "echo")) {
-        for (int i = 1; i < n; i++) {
-            char s[32];
-            snprintf(s, sizeof s, "%d", last_status);
-            out(t, strcmp(tk[i].v, "$?") ? tk[i].v : s);
-            if (i + 1 < n) out(t, " ");
-        }
-        out(t, "\n");
-        last_status = 0;
-        return;
-    }
-    last_status = execute_pipeline(t, tk, n);
+    char name[64];
+    snprintf(name, sizeof(name), "monospace:pixelsize=%d", size);
+
+    XftFont *new_font = XftFontOpenName(display, DefaultScreen(display), name);
+
+    if (new_font == NULL) return;
+
+    if (xft_font != NULL) XftFontClose(display, xft_font);
+
+    xft_font = new_font;
+    font_pixel_size = size;
+    line_height = xft_font->ascent + xft_font->descent + 8;
 }
 
-void execute_command(Tab *t) {
-    if (!t->in_len) return;
-    char line[INSZ];
-    snprintf(line, sizeof line, "%s", t->input);
-    out(t, t->cont ? "> " : "user@terminator> ");
-    out(t, line); out(t, "\n");
+static void draw_text(XftColor *color, int x, int y,
+                      const char *text, int length) {
+    if (xft_font == NULL || xft_draw == NULL || length <= 0) return;
 
-    if (t->cmd_len > 0 && t->cmd_len < CMDSZ - 1) t->command[t->cmd_len++] = '\n';
-    size_t ll = strlen(line);
-    if (t->cmd_len + (int)ll >= CMDSZ) {
-        out(t, "terminator: command too long\n");
-        t->cont = 0;
+    XftDrawStringUtf8(xft_draw, color, xft_font, x, y,
+                      (const FcChar8 *)text, length);
+}
+
+static int text_width(const char *text, int length) {
+    XGlyphInfo extents;
+
+    if (xft_font == NULL || length <= 0) return 0;
+
+    XftTextExtentsUtf8(display, xft_font,
+                       (const FcChar8 *)text, length, &extents);
+    return extents.xOff;
+}
+
+void draw_window(void) {
+    XWindowAttributes attributes;
+    XGetWindowAttributes(display, window, &attributes);
+
+    /* Draw the wallpaper scaled to the current window size. */
+    if (wallpaper_picture != None && window_picture != None &&
+        wallpaper_width > 0 && wallpaper_height > 0 &&
+        attributes.width > 0 && attributes.height > 0) {
+        XTransform transform = {{
+            { XDoubleToFixed((double)wallpaper_width / attributes.width), 0, 0 },
+            { 0, XDoubleToFixed((double)wallpaper_height / attributes.height), 0 },
+            { 0, 0, XDoubleToFixed(1.0) }
+        }};
+        XRenderSetPictureTransform(display, wallpaper_picture, &transform);
+        XRenderSetPictureFilter(display, wallpaper_picture, FilterBilinear, NULL, 0);
+        XRenderComposite(display, PictOpSrc, wallpaper_picture, None,
+                         window_picture, 0, 0, 0, 0, 0, 0,
+                         (unsigned int)attributes.width,
+                         (unsigned int)attributes.height);
     } else {
-        memcpy(t->command + t->cmd_len, line, ll + 1);
-        t->cmd_len += (int)ll;
-        if (needs_continuation(t->command)) t->cont = 1;
-        else { t->cont = 0; save_history(t, t->command); run_command(t); }
+        XClearWindow(display, window);
     }
-    if (!t->cont) { t->cmd_len = 0; t->command[0] = 0; }
-    t->in_len = 0; t->input[0] = 0;
+
+    /* Tab heading. */
+    char heading[256] = "";
+    char part[64];
+    for (int i = 0; i < tab_count; i++) {
+        snprintf(part, sizeof(part), "  [%d]%s  ",
+                 i + 1, i == active_tab ? "*" : "");
+        if (strlen(heading) + strlen(part) < sizeof(heading) - 1)
+            strcat(heading, part);
+    }
+    draw_text(&col_heading, 15, line_height, heading, (int)strlen(heading));
+
+    Tab *tab = &tabs[active_tab];
+    int first_output_y = 2 * line_height;
+    int max_output_rows = (attributes.height - 4 * line_height) / line_height;
+    if (max_output_rows < 1) max_output_rows = 1;
+
+    /* Render the transcript in order: welcome text, previous prompts,
+       commands, and command output. The editable prompt follows the output. */
+    char *copy = malloc(strlen(tab->output) + 1);
+    int displayed_rows = 0;
+    if (copy != NULL) {
+        strcpy(copy, tab->output);
+        char *lines[2048];
+        int count = 0;
+        char *p = copy;
+        while (count < (int)(sizeof(lines) / sizeof(lines[0]))) {
+            lines[count++] = p;
+            char *newline = strchr(p, '\n');
+            if (newline == NULL) break;
+            *newline = '\0';
+            p = newline + 1;
+        }
+        if (count > 0 && lines[count - 1][0] == '\0') count--;
+
+        int first = count > max_output_rows ? count - max_output_rows : 0;
+        int y = first_output_y;
+        for (int i = first; i < count && displayed_rows < max_output_rows;
+             i++, displayed_rows++, y += line_height) {
+            draw_text(&col_output, 15, y, lines[i], (int)strlen(lines[i]));
+        }
+        free(copy);
+    }
+
+    char prompt_buffer[PATH_MAX + 64];
+    if (tab->continuation) {
+        snprintf(prompt_buffer, sizeof(prompt_buffer), "> ");
+    } else {
+        snprintf(prompt_buffer, sizeof(prompt_buffer),
+                 "user@terminator:%s> ", tab->cwd);
+    }
+
+    /* Place the live prompt immediately after the last visible output line. */
+    int prompt_y = first_output_y + displayed_rows * line_height;
+    int bottom_limit = attributes.height - line_height / 2;
+    if (prompt_y > bottom_limit) prompt_y = bottom_limit;
+    const char *prompt = prompt_buffer;
+    draw_text(&col_prompt, 15, prompt_y, prompt, (int)strlen(prompt));
+
+    int input_x = 15 + text_width(prompt, (int)strlen(prompt));
+    draw_text(&col_input, input_x, prompt_y, tab->input, tab->input_length);
+    XFlush(display);
 }
 
-/* ---------- process mode: one shell process per tab; IPC = [type][uint32 len][payload] ---------- */
-static int wr(int fd, const void *d, size_t n) {
-    const char *p = d;
-    while (n) {
-        ssize_t k = write(fd, p, n);
-        if (k < 0 && errno == EINTR) continue;
-        if (k <= 0) return -1;
-        p += k; n -= (size_t)k;
+/* Check whether quotes are still open or a line ends in \. */
+/* Process-mode IPC: [type][uint32 length][payload]. */
+static int write_all_fd(int fd, const void *data, size_t length) {
+    const unsigned char *p = data;
+    while (length) {
+        ssize_t n = write(fd, p, length);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; length -= (size_t)n;
     }
     return 0;
 }
-static int send_ipc(int fd, char type, const void *d, uint32_t n) {
-    return (wr(fd, &type, 1) || wr(fd, &n, sizeof n) || (n && wr(fd, d, n))) ? -1 : 0;
+static int send_ipc(int fd, char type, const void *data, uint32_t length) {
+    if (write_all_fd(fd, &type, 1) || write_all_fd(fd, &length, sizeof(length))) return -1;
+    return length ? write_all_fd(fd, data, length) : 0;
 }
-static void shell_child(int in, int fo, const char *cwd) {
-    static Tab sh;
-    char line[INSZ], ch;
-    size_t u = 0;
-    proc_child = 1; running = 1;
-    snprintf(sh.cwd, sizeof sh.cwd, "%s", cwd);
-    for (;;) {
-        ssize_t n = read(in, &ch, 1);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return;
-        if (ch != '\n') { if (u < sizeof line - 1) line[u++] = ch; continue; }
-        line[u] = 0; u = 0;
-        snprintf(sh.input, sizeof sh.input, "%s", line);
-        sh.in_len = (int)strlen(sh.input);
-        size_t old = strlen(sh.output);
-        execute_command(&sh);
-        size_t nw = strlen(sh.output);
-        if (nw < old) { if (send_ipc(fo, 'C', NULL, 0)) return; old = 0; }
-        for (size_t pos = old; pos < nw;) {
-            uint32_t amt = (uint32_t)(nw - pos > CHUNK ? CHUNK : nw - pos);
-            if (send_ipc(fo, 'O', sh.output + pos, amt)) return;
-            pos += amt;
-        }
-        TabStatus st;
-        memset(&st, 0, sizeof st);
-        st.cont = sh.cont;
-        snprintf(st.cwd, sizeof st.cwd, "%s", sh.cwd);
-        if (send_ipc(fo, 'S', &st, (uint32_t)sizeof st) || !running) return;
-    }
-}
-static int start_process_tab(Tab *t) {
-    int cm[2] = {-1, -1}, ou[2] = {-1, -1};
-    pid_t pid = -1;
-    if (pipe(cm) == -1 || pipe(ou) == -1 || (pid = fork()) == -1) {
-        cl(cm[0]); cl(cm[1]); cl(ou[0]); cl(ou[1]);
+typedef struct { int continuation; char cwd[PATH_MAX]; } TabStatusMessage;
+static int start_process_tab(Tab *tab) {
+    int commands[2] = {-1,-1}, output[2] = {-1,-1};
+    if (pipe(commands) == -1 || pipe(output) == -1) {
+        if (commands[0] >= 0) { close(commands[0]); close(commands[1]); }
+        if (output[0] >= 0) { close(output[0]); close(output[1]); }
         return -1;
     }
+    pid_t pid = fork();
+    if (pid == -1) { close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); return -1; }
     if (pid == 0) {
-        close(cm[1]); close(ou[0]);
-        for (int i = 0; i < tab_count; i++) { cl(tabs[i].cmd_fd); cl(tabs[i].out_fd); }
-        shell_child(cm[0], ou[1], t->cwd);
-        _exit(0);
+        close(commands[1]); close(output[0]);
+        for (int i=0; i<tab_count; i++) {
+            if (tabs[i].command_fd >= 0) close(tabs[i].command_fd);
+            if (tabs[i].output_fd >= 0) close(tabs[i].output_fd);
+        }
+        (void)fcntl(commands[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(output[1], F_SETFD, FD_CLOEXEC);
+        process_mode_child = 1; shell_engine_worker = 1; running = 1;
+        Tab shell_tab; memset(&shell_tab, 0, sizeof(shell_tab));
+        snprintf(shell_tab.cwd, sizeof(shell_tab.cwd), "%s", tab->cwd);
+        char line[INPUT_SIZE]; size_t used = 0;
+        for (;;) {
+            char ch; ssize_t n = read(commands[0], &ch, 1);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            if (ch != '\n') { if (used < sizeof(line)-1) line[used++] = ch; continue; }
+            line[used] = '\0';
+            snprintf(shell_tab.input, sizeof(shell_tab.input), "%s", line);
+            shell_tab.input_length = (int)strlen(shell_tab.input);
+            size_t oldlen = strlen(shell_tab.output);
+            execute_command(&shell_tab);
+            size_t newlen = strlen(shell_tab.output);
+            if (newlen < oldlen) { if (send_ipc(output[1], 'C', NULL, 0)) break; oldlen = 0; }
+            for (size_t pos = oldlen; pos < newlen;) {
+                uint32_t amount = (uint32_t)(newlen-pos); if (amount > 2048) amount = 2048;
+                if (send_ipc(output[1], 'O', shell_tab.output+pos, amount)) goto child_done;
+                pos += amount;
+            }
+            TabStatusMessage status; memset(&status, 0, sizeof(status));
+            status.continuation = shell_tab.continuation;
+            snprintf(status.cwd, sizeof(status.cwd), "%s", shell_tab.cwd);
+            if (send_ipc(output[1], 'S', &status, (uint32_t)sizeof(status))) break;
+            used = 0; if (!running) break;
+        }
+child_done:
+        close(commands[0]); close(output[1]); _exit(0);
     }
-    close(cm[0]); close(ou[1]);
-    int fl = fcntl(ou[0], F_GETFL, 0);
-    if (fl != -1) fcntl(ou[0], F_SETFL, fl | O_NONBLOCK);
-    t->pid = pid; t->cmd_fd = cm[1]; t->out_fd = ou[0]; t->ipc_len = 0;
+    close(commands[0]); close(output[1]);
+    int flags = fcntl(output[0], F_GETFL, 0);
+    if (flags != -1) (void)fcntl(output[0], F_SETFL, flags | O_NONBLOCK);
+    tab->shell_pid = pid; tab->command_fd = commands[1]; tab->output_fd = output[0]; tab->ipc_pending_len = 0;
     return 0;
 }
-static void stop_process_tab(Tab *t) {
-    cl(t->cmd_fd); cl(t->out_fd);
-    if (t->pid > 0) { kill(t->pid, SIGTERM); while (waitpid(t->pid, NULL, 0) == -1 && errno == EINTR) {} }
-    t->cmd_fd = t->out_fd = -1; t->pid = -1;
-}
-static void parse_ipc(Tab *t) {
-    size_t u = 0;
-    while (t->ipc_len - u >= 5) {
-        unsigned char *p = t->ipc + u;
-        uint32_t len;
-        memcpy(&len, p + 1, sizeof len);
-        if (len > sizeof t->ipc - 5) { t->ipc_len = 0; return; }
-        if (t->ipc_len - u < 5 + (size_t)len) break;
-        if (p[0] == 'O') {
-            char c[CHUNK + 1];
-            size_t a = len > CHUNK ? CHUNK : len;
-            memcpy(c, p + 5, a); c[a] = 0;
-            out(t, c);
-        } else if (p[0] == 'C') t->output[0] = 0;
-        else if (p[0] == 'S' && len == sizeof(TabStatus)) {
-            TabStatus st;
-            memcpy(&st, p + 5, sizeof st);
-            t->cont = st.cont;
-            snprintf(t->cwd, sizeof t->cwd, "%s", st.cwd);
-        }
-        u += 5 + (size_t)len;
-    }
-    if (u) { memmove(t->ipc, t->ipc + u, t->ipc_len - u); t->ipc_len -= u; }
-}
-/* Drain the pipe; parse after every chunk so the 8 KB frame buffer never overflows. */
-static void process_tab_ipc(Tab *t) {
-    unsigned char in[CHUNK];
+
+typedef struct {
+    int command_read_fd;
+    int output_write_fd;
+    Tab shell_tab;
+} ThreadShellContext;
+
+static void *thread_shell_main(void *arg) {
+    ThreadShellContext *ctx = arg;
+    shell_engine_worker = 1;
+    shell_worker_should_exit = 0;
+    Tab *tab = &ctx->shell_tab;
+    char line[INPUT_SIZE];
+    size_t used = 0;
     for (;;) {
-        ssize_t n = read(t->out_fd, in, sizeof in);
+        char ch;
+        ssize_t n = read(ctx->command_read_fd, &ch, 1);
         if (n < 0 && errno == EINTR) continue;
-        if (n == 0) { close(t->out_fd); t->out_fd = -1; break; }
-        if (n < 0) break;
-        for (size_t off = 0; off < (size_t)n;) {
-            size_t room = sizeof t->ipc - t->ipc_len, a = (size_t)n - off < room ? (size_t)n - off : room;
-            memcpy(t->ipc + t->ipc_len, in + off, a);
-            t->ipc_len += a; off += a;
-            parse_ipc(t);
+        if (n <= 0) break;
+        if (ch != '\n') { if (used < sizeof(line)-1) line[used++] = ch; continue; }
+        line[used] = '\0';
+        snprintf(tab->input, sizeof(tab->input), "%s", line);
+        tab->input_length = (int)strlen(tab->input);
+        size_t oldlen = strlen(tab->output);
+        execute_command(tab);
+        size_t newlen = strlen(tab->output);
+        if (newlen < oldlen) {
+            if (send_ipc(ctx->output_write_fd, 'C', NULL, 0)) break;
+            oldlen = 0;
         }
+        for (size_t pos = oldlen; pos < newlen;) {
+            uint32_t amount = (uint32_t)(newlen-pos);
+            if (amount > 2048) amount = 2048;
+            if (send_ipc(ctx->output_write_fd, 'O', tab->output+pos, amount)) goto thread_done;
+            pos += amount;
+        }
+        TabStatusMessage status;
+        memset(&status, 0, sizeof(status));
+        status.continuation = tab->continuation;
+        snprintf(status.cwd, sizeof(status.cwd), "%s", tab->cwd);
+        if (send_ipc(ctx->output_write_fd, 'S', &status, (uint32_t)sizeof(status))) break;
+        used = 0;
+        if (shell_worker_should_exit) break;
     }
+thread_done:
+    close(ctx->command_read_fd);
+    close(ctx->output_write_fd);
+    return NULL;
 }
 
-/* ---------- main ---------- */
-int main(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "useProcess=True")) proc_mode = 1;
-    if (!(dpy = XOpenDisplay(NULL))) { fprintf(stderr, "Cannot open X11 display.\n"); return 1; }
-    int scr = DefaultScreen(dpy);
-    win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 100, 100, 900, 600, 1, BlackPixel(dpy, scr), WhitePixel(dpy, scr));
-    XStoreName(dpy, win, "Terminator - Custom Terminal");
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
+static int start_thread_tab(Tab *tab) {
+    int commands[2] = {-1,-1}, output[2] = {-1,-1};
+    if (pipe(commands) == -1 || pipe(output) == -1) {
+        if (commands[0] >= 0) { close(commands[0]); close(commands[1]); }
+        if (output[0] >= 0) { close(output[0]); close(output[1]); }
+        return -1;
+    }
+    ThreadShellContext *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) { close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); return -1; }
+    ctx->command_read_fd = commands[0];
+    ctx->output_write_fd = output[1];
+    snprintf(ctx->shell_tab.cwd, sizeof(ctx->shell_tab.cwd), "%s", tab->cwd);
+    if (pthread_create(&tab->shell_thread, NULL, thread_shell_main, ctx) != 0) {
+        close(commands[0]); close(commands[1]); close(output[0]); close(output[1]); free(ctx); return -1;
+    }
+    int flags = fcntl(output[0], F_GETFL, 0);
+    if (flags != -1) (void)fcntl(output[0], F_SETFL, flags | O_NONBLOCK);
+    tab->command_fd = commands[1];
+    tab->output_fd = output[0];
+    tab->thread_started = 1;
+    tab->thread_context = ctx;
+    return 0;
+}
+static void stop_thread_tab(Tab *tab) {
+    if (tab->command_fd >= 0) { close(tab->command_fd); tab->command_fd = -1; }
+    if (tab->thread_started) {
+        (void)pthread_join(tab->shell_thread, NULL);
+        tab->thread_started = 0;
+    }
+    if (tab->output_fd >= 0) { close(tab->output_fd); tab->output_fd = -1; }
+    free(tab->thread_context);
+    tab->thread_context = NULL;
+}
 
-    Visual *vis = DefaultVisual(dpy, scr);
-    Colormap cm = DefaultColormap(dpy, scr);
-    xd = XftDrawCreate(dpy, win, vis, cm);
-    XftColorAllocName(dpy, vis, cm, "#FF4D6D", &c_head);
-    XftColorAllocName(dpy, vis, cm, "#EAF2FF", &c_out);
-    XftColorAllocName(dpy, vis, cm, "#7CFF6B", &c_prompt);
-    XftColorAllocName(dpy, vis, cm, "#63E6FF", &c_in);
-    update_font(900, 600);
-    if (!font) { fprintf(stderr, "Cannot load a monospace Xft font.\n"); return 1; }
-    if (load_wallpaper(bgs[cur_bg]) == -1) fprintf(stderr, "Warning: could not load initial wallpaper %s\n", bgs[cur_bg]);
 
-    for (int i = 0; i < MAX_TABS; i++) init_tab(&tabs[i]);
-    if (proc_mode && start_process_tab(&tabs[0]) == -1) {
-        fprintf(stderr, "Cannot start tab shell process.\n");
-        XCloseDisplay(dpy);
+static void stop_process_tab(Tab *tab) {
+    if (tab->command_fd >= 0) close(tab->command_fd);
+    if (tab->output_fd >= 0) close(tab->output_fd);
+    if (tab->shell_pid > 0) { kill(tab->shell_pid, SIGTERM); while (waitpid(tab->shell_pid, NULL, 0) == -1 && errno == EINTR) {} }
+    tab->command_fd = tab->output_fd = -1; tab->shell_pid = -1;
+}
+static void process_tab_ipc(Tab *tab) {
+    unsigned char incoming[2048];
+    for (;;) {
+        ssize_t n = read(tab->output_fd, incoming, sizeof(incoming));
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0) { close(tab->output_fd); tab->output_fd = -1; break; }
+        if (n < 0) break;
+        size_t room = sizeof(tab->ipc_pending)-tab->ipc_pending_len;
+        size_t amount = (size_t)n < room ? (size_t)n : room;
+        memcpy(tab->ipc_pending+tab->ipc_pending_len, incoming, amount);
+        tab->ipc_pending_len += amount;
+        if (amount < (size_t)n) break;
+    }
+    size_t used = 0;
+    while (tab->ipc_pending_len-used >= 5) {
+        unsigned char *p = tab->ipc_pending+used; char type = (char)p[0]; uint32_t len;
+        memcpy(&len, p+1, sizeof(len));
+        if (len > sizeof(tab->ipc_pending)-5) { tab->ipc_pending_len=0; return; }
+        if (tab->ipc_pending_len-used < 5+(size_t)len) break;
+        const unsigned char *data = p+5;
+        if (type == 'O') {
+            char chunk[2049]; size_t amount = len > 2048 ? 2048 : len;
+            memcpy(chunk,data,amount); chunk[amount]='\0'; append_output(tab,chunk);
+        } else if (type == 'C') tab->output[0]='\0';
+        else if (type == 'S' && len == sizeof(TabStatusMessage)) {
+            TabStatusMessage status; memcpy(&status,data,sizeof(status));
+            tab->continuation=status.continuation; snprintf(tab->cwd,sizeof(tab->cwd),"%s",status.cwd);
+        }
+        used += 5+(size_t)len;
+    }
+    if (used) { memmove(tab->ipc_pending,tab->ipc_pending+used,tab->ipc_pending_len-used); tab->ipc_pending_len-=used; }
+}
+
+
+int needs_continuation(const char *text) {
+    char quote = '\0';
+    int escaped = 0;
+    int length = (int)strlen(text);
+
+    for (int i = 0; i < length; i++) {
+        char c = text[i];
+
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+
+        if (c == '\\' && quote != '\'') {
+            escaped = 1;
+            continue;
+        }
+
+        if (quote == '\0' && (c == '\'' || c == '"')) {
+            quote = c;
+        } else if (quote != '\0' && c == quote) {
+            quote = '\0';
+        }
+    }
+
+    return quote != '\0' || escaped;
+}
+
+/*
+ * Expand wildcard arguments such as *.txt.
+ *
+ * Quoting information must be preserved by the tokenizer
+ * if quoted wildcards are to remain literal.
+ */
+static int expand_wildcards(
+    char *args[],
+    int max_args,
+    char *expanded[],
+    int *expanded_count
+) {
+    int out = 0;
+
+    for (int i = 0; args[i] != NULL; i++) {
+        glob_t matches;
+        memset(&matches, 0, sizeof(matches));
+
+        int has_wildcard =
+            strpbrk(args[i], "*?[") != NULL;
+
+        if (!has_wildcard) {
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        int result = glob(args[i], 0, NULL, &matches);
+
+        if (result == GLOB_NOMATCH) {
+            /* Shell convention: keep unmatched patterns literal. */
+            globfree(&matches);
+
+            if (out >= max_args - 1) {
+                return -1;
+            }
+
+            expanded[out++] = args[i];
+            continue;
+        }
+
+        if (result != 0) {
+            globfree(&matches);
+            return -1;
+        }
+
+        for (size_t j = 0; j < matches.gl_pathc; j++) {
+            if (out >= max_args - 1) {
+                globfree(&matches);
+                return -1;
+            }
+
+            expanded[out++] = strdup(matches.gl_pathv[j]);
+
+            if (expanded[out - 1] == NULL) {
+                globfree(&matches);
+
+                for (int k = 0; k < out; k++) {
+                    /* Only duplicated entries should be freed. */
+                    /* Use the ownership-aware version below. */
+                }
+
+                return -1;
+            }
+        }
+
+        globfree(&matches);
+    }
+
+    expanded[out] = NULL;
+    *expanded_count = out;
+    return 0;
+}
+/* Run a pipeline of external commands. */
+int execute_pipeline(Tab *tab, Token tokens[], int count) {
+    char *args[MAX_PIPELINE][MAX_ARGS];
+    char *input_files[MAX_PIPELINE];
+    char *output_files[MAX_PIPELINE];
+    int stages = 1;
+    int argc[MAX_PIPELINE] = {0};
+
+    memset(input_files, 0, sizeof(input_files));
+    memset(output_files, 0, sizeof(output_files));
+
+    for (int i = 0; i < count; i++) {
+        if (tokens[i].type == TOKEN_PIPE) {
+            stages++;
+
+            if (stages > MAX_PIPELINE) {
+                append_output(tab, "terminator: too many pipeline stages\n");
+                return 2;
+            }
+        }
+    }
+
+    int stage = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (tokens[i].type == TOKEN_PIPE) {
+            if (argc[stage] == 0) {
+                append_output(tab, "terminator: empty pipeline stage\n");
+                return 2;
+            }
+
+            stage++;
+            continue;
+        }
+
+        if (tokens[i].type == TOKEN_INPUT ||
+            tokens[i].type == TOKEN_OUTPUT) {
+            int is_input = tokens[i].type == TOKEN_INPUT;
+
+            if (i + 1 >= count ||
+                tokens[i + 1].type != TOKEN_WORD) {
+                append_output(tab, "terminator: missing redirection filename\n");
+                return 2;
+            }
+
+            if (is_input) {
+                input_files[stage] = tokens[++i].value;
+            } else {
+                output_files[stage] = tokens[++i].value;
+            }
+
+            continue;
+        }
+
+        if (argc[stage] >= MAX_ARGS - 1) {
+            append_output(tab, "terminator: too many arguments\n");
+            return 2;
+        }
+
+        args[stage][argc[stage]++] = tokens[i].value;
+    }
+
+    if (argc[stage] == 0) {
+        append_output(tab, "terminator: empty command\n");
+        return 2;
+    }
+
+    for (int s = 0; s < stages; s++) {
+        args[s][argc[s]] = NULL;
+    }
+
+    int output_pipe[2];
+
+    if (pipe(output_pipe) == -1) {
+        append_output(tab, "terminator: pipe failed\n");
         return 1;
     }
-    XMapWindow(dpy, win);
-    out(&tabs[0], "Terminator: Custom Terminal\nBasic quoting, redirection and pipelines\n"
+
+    int previous_read = -1;
+    pid_t pids[MAX_PIPELINE];
+
+    for (int s = 0; s < stages; s++) {
+        int next_pipe[2] = {-1, -1};
+
+        if (s < stages - 1 && pipe(next_pipe) == -1) {
+            append_output(tab, "terminator: pipe failed\n");
+
+            if (previous_read != -1) close(previous_read);
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+
+            return 1;
+        }
+
+        pid_t pid = fork();
+
+        if (pid == -1) {
+            append_output(tab, "terminator: fork failed\n");
+
+            if (previous_read != -1) close(previous_read);
+            if (next_pipe[0] != -1) close(next_pipe[0]);
+            if (next_pipe[1] != -1) close(next_pipe[1]);
+
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+
+            return 1;
+        }
+
+        if (pid == 0) {
+            if (chdir(tab->cwd) == -1) {
+    dprintf(STDERR_FILENO,
+            "terminator: cannot enter tab directory\n");
+    _exit(1);
+}
+            if (previous_read != -1) {
+                dup2(previous_read, STDIN_FILENO);
+            }
+
+            if (s < stages - 1) {
+                dup2(next_pipe[1], STDOUT_FILENO);
+            } else {
+                dup2(output_pipe[1], STDOUT_FILENO);
+            }
+
+            dup2(output_pipe[1], STDERR_FILENO);
+
+            if (previous_read != -1) close(previous_read);
+            if (next_pipe[0] != -1) close(next_pipe[0]);
+            if (next_pipe[1] != -1) close(next_pipe[1]);
+
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+
+            if (input_files[s] != NULL) {
+                int fd = open(input_files[s], O_RDONLY);
+
+                if (fd == -1) {
+                    perror(input_files[s]);
+                    _exit(1);
+                }
+
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+
+            if (output_files[s] != NULL) {
+                int fd = open(output_files[s],
+                              O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+                if (fd == -1) {
+                    perror(output_files[s]);
+                    _exit(1);
+                }
+
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+
+          
+            char *expanded[MAX_ARGS];
+            int expanded_count = 0;
+
+            if (expand_wildcards(
+                    args[s],
+                    MAX_ARGS,
+                    expanded,
+                    &expanded_count
+                ) == -1) {
+                dprintf(STDERR_FILENO,
+                        "terminator: wildcard expansion failed\n");
+                _exit(1);
+            }
+
+            execvp(expanded[0], expanded);
+
+            /* execvp returns only when execution fails. */
+            perror(expanded[0]);
+
+            /* Free duplicated wildcard arguments on failure. */
+            for (int i = 0; i < expanded_count; i++) {
+                int original = 0;
+
+                for (int j = 0; args[s][j] != NULL; j++) {
+                    if (expanded[i] == args[s][j]) {
+                        original = 1;
+                        break;
+                    }
+                }
+
+                if (!original) {
+                    free(expanded[i]);
+                }
+            }
+
+            _exit(127);
+
+        }
+
+        pids[s] = pid;
+
+        if (previous_read != -1) close(previous_read);
+        if (next_pipe[1] != -1) close(next_pipe[1]);
+
+        previous_read = next_pipe[0];
+    }
+
+    if (previous_read != -1) close(previous_read);
+    close(output_pipe[1]);
+
+    char buffer[512];
+    ssize_t bytes;
+
+    while ((bytes = read(output_pipe[0], buffer, sizeof(buffer))) > 0) {
+        size_t used = strlen(tab->output);
+
+        if (used < BUFFER_SIZE - 1) {
+            size_t available = BUFFER_SIZE - used - 1;
+            size_t amount = (size_t)bytes;
+
+            if (amount > available) {
+                amount = available;
+            }
+
+            memcpy(tab->output + used, buffer, amount);
+            tab->output[used + amount] = '\0';
+        }
+    }
+    close(output_pipe[0]);
+
+    int result = 0;
+
+    for (int s = 0; s < stages; s++) {
+        int status;
+
+        if (waitpid(pids[s], &status, 0) == -1) {
+            result = 1;
+        } else if (s == stages - 1) {
+            if (WIFEXITED(status)) {
+                result = WEXITSTATUS(status);
+            } else {
+                result = 1;
+            }
+        }
+    }
+
+    return result;
+}
+
+
+void execute_command(Tab *tab) {
+    if (tab->input_length == 0) return;
+
+    char line[INPUT_SIZE];
+
+    snprintf(line, sizeof(line), "%s", tab->input);
+
+    append_output(tab, tab->continuation ? "> " : "user@terminator> ");
+    append_output(tab, line);
+    append_output(tab, "\n");
+
+    if (tab->command_length > 0 &&
+        tab->command_length < COMMAND_SIZE - 1) {
+        tab->command[tab->command_length++] = '\n';
+    }
+
+    size_t line_length = strlen(line);
+
+    if (tab->command_length + (int)line_length >= COMMAND_SIZE) {
+        append_output(tab, "terminator: command too long\n");
+        tab->command_length = 0;
+        tab->command[0] = '\0';
+        tab->continuation = 0;
+        goto clear_input;
+    }
+
+    memcpy(tab->command + tab->command_length, line, line_length);
+    tab->command_length += (int)line_length;
+    tab->command[tab->command_length] = '\0';
+
+    if (needs_continuation(tab->command)) {
+        tab->continuation = 1;
+        goto clear_input;
+    }
+
+    tab->continuation = 0;
+    save_history(tab, tab->command);
+
+    Token tokens[MAX_TOKENS];
+    int count = 0;
+
+    if (tokenize(tab->command, tokens, &count) == -1) {
+        append_output(tab, "terminator: invalid or incomplete command\n");
+        last_status = 2;
+        goto reset_command;
+    }
+
+    if (count == 0) goto reset_command;
+
+    int has_pipe = 0;
+    int has_redirect = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (tokens[i].type == TOKEN_PIPE) has_pipe = 1;
+        if (tokens[i].type == TOKEN_INPUT ||
+            tokens[i].type == TOKEN_OUTPUT) has_redirect = 1;
+    }
+
+    if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "exit") == 0) {
+        if (shell_engine_worker) shell_worker_should_exit = 1;
+        else running = 0;
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
+    strcmp(tokens[0].value, "cd") == 0) {
+
+    const char *path = count > 1
+        ? tokens[1].value
+        : getenv("HOME");
+
+    if (path == NULL || path[0] == '\0') {
+        append_output(tab, "terminator: cd: missing directory\n");
+        last_status = 1;
+    } else {
+        char resolved[PATH_MAX];
+
+        if (path[0] == '/') {
+    if (snprintf(resolved, sizeof(resolved), "%s", path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
+        goto reset_command;
+    }
+} else {
+    if (snprintf(resolved, sizeof(resolved), "%s/%s",
+                 tab->cwd, path)
+        >= (int)sizeof(resolved)) {
+        append_output(tab, "terminator: cd: path too long\n");
+        last_status = 1;
+        goto reset_command;
+    }
+}
+
+        char *canonical = realpath(resolved, NULL);
+
+        if (canonical == NULL) {
+            append_output(tab,
+                          "terminator: cd: cannot change directory\n");
+            last_status = 1;
+        } else {
+            if (strlen(canonical) >= sizeof(tab->cwd)) {
+                append_output(tab, "terminator: cd: path too long\n");
+                last_status = 1;
+            } else {
+                snprintf(tab->cwd, sizeof(tab->cwd), "%s", canonical);
+                last_status = 0;
+            }
+
+            free(canonical);
+        }
+    }
+
+    goto reset_command;
+}
+
+    if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "history") == 0) {
+        char text[INPUT_SIZE + 32];
+
+        for (int i = 0; i < tab->history_count; i++) {
+            snprintf(text, sizeof(text), "%4d  %s\n",
+                     i + 1, tab->history[i]);
+
+            append_output(tab, text);
+        }
+
+        last_status = 0;
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "background_image_change") == 0) {
+        if (shell_engine_worker) {
+            append_output(tab, "terminator: background changes are handled by the GUI (use F5)\n");
+            last_status = 1;
+            goto reset_command;
+        }
+        if (background_image_change() == 0) {
+            draw_window();
+            XFlush(display);
+            append_output(tab, "Background image changed.\n");
+        } else {
+            append_output(tab,
+                          "terminator: no other loadable XPM background found\n");
+            last_status = 1;
+        }
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "clear") == 0) {
+        tab->output[0] = '\0';
+        last_status = 0;
+        goto reset_command;
+    }
+
+    if (!has_pipe && !has_redirect &&
+        strcmp(tokens[0].value, "echo") == 0) {
+        for (int i = 1; i < count; i++) {
+            if (strcmp(tokens[i].value, "$?") == 0) {
+                char status_text[32];
+                snprintf(status_text, sizeof(status_text), "%d", last_status);
+                append_output(tab, status_text);
+            } else {
+                append_output(tab, tokens[i].value);
+            }
+
+            if (i + 1 < count) append_output(tab, " ");
+        }
+
+        append_output(tab, "\n");
+        last_status = 0;
+        goto reset_command;
+    }
+
+    last_status = execute_pipeline(tab, tokens, count);
+
+reset_command:
+    tab->command_length = 0;
+    tab->command[0] = '\0';
+
+clear_input:
+    tab->input_length = 0;
+    tab->input[0] = '\0';
+}
+
+int main(int argc, char **argv) {
+    for (int i=1; i<argc; i++) {
+        if (strcmp(argv[i], "useProcess=True")==0) use_process_mode=1;
+        if (strcmp(argv[i], "useThread=True")==0) use_thread_mode=1;
+    }
+    /* Thread mode is the required default; process mode is explicitly opt-in. */
+    if (!use_process_mode && !use_thread_mode) use_thread_mode = 1;
+    if (use_process_mode && use_thread_mode) { fprintf(stderr, "Choose either useProcess=True or useThread=True, not both.\n"); return 2; }
+    display = XOpenDisplay(NULL);
+
+    if (display == NULL) {
+        fprintf(stderr, "Cannot open X11 display.\n");
+        return 1;
+    }
+
+    int screen = DefaultScreen(display);
+
+    window = XCreateSimpleWindow(
+        display, RootWindow(display, screen),
+        100, 100, 900, 600, 1,
+        BlackPixel(display, screen),
+        WhitePixel(display, screen)
+    );
+
+    XStoreName(display, window, "Terminator - Custom Terminal");
+
+    XSelectInput(display, window,
+                 ExposureMask | KeyPressMask | StructureNotifyMask);
+
+    gc = XCreateGC(display, window, 0, NULL);
+
+    /* Xft drawing surface and colors. */
+    Visual *xft_visual = DefaultVisual(display, screen);
+    Colormap colormap = DefaultColormap(display, screen);
+
+    xft_draw = XftDrawCreate(display, window, xft_visual, colormap);
+
+    XftColorAllocName(display, xft_visual, colormap, "#FF4D6D", &col_heading);
+    XftColorAllocName(display, xft_visual, colormap, "#EAF2FF", &col_output);
+    XftColorAllocName(display, xft_visual, colormap, "#7CFF6B", &col_prompt);
+    XftColorAllocName(display, xft_visual, colormap, "#63E6FF", &col_input);
+
+    /* Pick a font that matches the initial window size. */
+    update_font(900, 600);
+
+    if (xft_font == NULL) {
+        fprintf(stderr, "Cannot load a monospace Xft font.\n");
+        return 1;
+    }
+
+    /* Load the anime wallpaper. */
+    wallpaper = None;
+    wallpaper_picture = None;
+    window_picture = None;
+
+    if (load_wallpaper(background_images[current_background_image]) == -1) {
+        fprintf(stderr, "Warning: could not load initial wallpaper %s\n",
+                background_images[current_background_image]);
+    }
+    initialize_tab_cwd(&tabs[0]);
+    for (int i=0; i<MAX_TABS; i++) { tabs[i].command_fd=-1; tabs[i].output_fd=-1; tabs[i].shell_pid=-1; }
+    if (use_process_mode && start_process_tab(&tabs[0]) == -1) { fprintf(stderr, "Cannot start tab shell process.\n"); XCloseDisplay(display); return 1; }
+    if (use_thread_mode && start_thread_tab(&tabs[0]) == -1) { fprintf(stderr, "Cannot start tab shell thread.\n"); XCloseDisplay(display); return 1; }
+    XMapWindow(display, window);
+
+    append_output(&tabs[0],
+                  "Terminator: Custom Terminal\n"
+                  "Basic quoting, redirection and pipelines\n"
                   "Ctrl+T: new tab; Ctrl+W: close tab; F1-F4: switch\n\n");
 
     while (running) {
-        if (proc_mode) {
-            struct pollfd fds[MAX_TABS + 1];
-            int map[MAX_TABS + 1], nf = 1;
-            fds[0] = (struct pollfd){ConnectionNumber(dpy), POLLIN, 0};
-            for (int i = 0; i < tab_count; i++)
-                if (tabs[i].out_fd >= 0) { fds[nf] = (struct pollfd){tabs[i].out_fd, POLLIN | POLLHUP, 0}; map[nf++] = i; }
-            if (XPending(dpy) == 0) {
-                if (poll(fds, (nfds_t)nf, 50) > 0)
-                    for (int j = 1; j < nf; j++)
-                        if (fds[j].revents & (POLLIN | POLLHUP | POLLERR)) process_tab_ipc(&tabs[map[j]]);
-                if (XPending(dpy) == 0) { draw_window(); continue; }
+        if (use_process_mode || use_thread_mode) {
+            struct pollfd fds[MAX_TABS+1]; int map[MAX_TABS+1]; int nfds=1;
+            fds[0].fd=ConnectionNumber(display); fds[0].events=POLLIN; fds[0].revents=0; map[0]=-1;
+            for (int i=0;i<tab_count;i++) if (tabs[i].output_fd>=0) { fds[nfds].fd=tabs[i].output_fd; fds[nfds].events=POLLIN|POLLHUP; fds[nfds].revents=0; map[nfds++]=i; }
+            if (XPending(display)==0) {
+                int pr=poll(fds,(nfds_t)nfds,50);
+                if (pr>0) for (int j=1;j<nfds;j++) if (fds[j].revents&(POLLIN|POLLHUP|POLLERR)) process_tab_ipc(&tabs[map[j]]);
+                if (XPending(display)==0) { draw_window(); continue; }
             }
         }
-        XEvent ev;
-        XNextEvent(dpy, &ev);
-        if (ev.type == Expose) { if (ev.xexpose.count == 0) draw_window(); continue; }
-        if (ev.type == DestroyNotify) { running = 0; continue; }
-        if (ev.type == ConfigureNotify) { update_font(ev.xconfigure.width, ev.xconfigure.height); draw_window(); continue; }
-        if (ev.type == ButtonPress) {                /* mouse wheel */
-            if (ev.xbutton.button == Button4) tabs[active].scroll += 3;
-            else if (ev.xbutton.button == Button5) tabs[active].scroll -= 3;
-            else continue;
+        XEvent event;
+        XNextEvent(display, &event);
+
+        if (event.type == Expose) {
+            if (event.xexpose.count == 0) {
+                draw_window();
+            }
+            continue;
+        }
+
+        if (event.type == DestroyNotify) {
+            running = 0;
+            continue;
+        }
+
+        if (event.type == ConfigureNotify) {
+            update_font(event.xconfigure.width,
+                        event.xconfigure.height);
             draw_window();
             continue;
         }
-        if (ev.type != KeyPress) continue;
 
-        char txt[32];
-        KeySym key;
-        int len = XLookupString(&ev.xkey, txt, (int)sizeof txt, &key, NULL);
-        int ctrl = ev.xkey.state & ControlMask;
-        Tab *t = &tabs[active];
-
-        if (ctrl && (key == XK_t || key == XK_T)) {
-            if (tab_count < MAX_TABS) {
-                active = tab_count++;
-                init_tab(&tabs[active]);
-                out(&tabs[active], "New tab opened.\n\n");
-                if (proc_mode && start_process_tab(&tabs[active]) == -1) {
-                    tab_count--; active = tab_count - 1;
-                    out(&tabs[active], "terminator: could not start tab process\n");
-                }
-            }
-        } else if (ctrl && (key == XK_w || key == XK_W)) {
-            if (tab_count > 1) {
-                if (proc_mode) stop_process_tab(t);
-                for (int i = active; i < tab_count - 1; i++) tabs[i] = tabs[i + 1];
-                if (active >= --tab_count) active = tab_count - 1;
-            } else running = 0;
-        } else if (key == XK_F5) {
-            if (background_image_change() == -1) out(t, "terminator: no other loadable XPM background found\n");
-            else draw_window();
-        } else if (key >= XK_F1 && key <= XK_F4) {
-            if ((int)(key - XK_F1) < tab_count) active = (int)(key - XK_F1);
-        } else if (key == XK_Prior || key == XK_Next || key == XK_Home || key == XK_End ||
-                   ((ev.xkey.state & ShiftMask) && (key == XK_Up || key == XK_Down))) {
-            int step = (key == XK_Prior || key == XK_Next) ? page_rows - 1 : 1;
-            if (key == XK_Prior || key == XK_Up) t->scroll += step;
-            else if (key == XK_Next || key == XK_Down) t->scroll -= step;
-            else t->scroll = key == XK_Home ? INT_MAX / 2 : 0;
-        } else if (key == XK_Return || key == XK_KP_Enter) {
-            t->scroll = 0;
-            if (!proc_mode) execute_command(t);
-            else {
-                if (t->cmd_fd >= 0) {
-                    char l[INSZ + 2];
-                    int n = snprintf(l, sizeof l, "%s\n", t->input);
-                    if (n > 0 && wr(t->cmd_fd, l, (size_t)n) == -1) out(t, "terminator: failed to send command to tab process\n");
-                }
-                t->in_len = 0; t->input[0] = 0;
-            }
-        } else if (key == XK_BackSpace) {
-            t->scroll = 0;
-            if (t->in_len > 0) t->input[--t->in_len] = 0;
-        } else if (key == XK_Escape) {
-            t->scroll = 0; t->in_len = 0; t->input[0] = 0;
-        } else if (len > 0 && txt[0] >= 32 && txt[0] <= 126 && t->in_len < INSZ - 1) {
-            t->scroll = 0;
-            t->input[t->in_len++] = txt[0];
-            t->input[t->in_len] = 0;
+        if (event.type != KeyPress) {
+            continue;
         }
+
+        char text[32];
+        KeySym key;
+        XKeyEvent *key_event = &event.xkey;
+
+        int length = XLookupString(
+            key_event, text, (int)sizeof(text), &key, NULL);
+
+        Tab *tab = &tabs[active_tab];
+
+        if ((key_event->state & ControlMask) &&
+            (key == XK_t || key == XK_T)) {
+            if (tab_count < MAX_TABS) {
+                active_tab = tab_count++;
+                memset(&tabs[active_tab], 0, sizeof(Tab));
+                tabs[active_tab].command_fd=-1; tabs[active_tab].output_fd=-1; tabs[active_tab].shell_pid=-1;
+                initialize_tab_cwd(&tabs[active_tab]);
+                append_output(&tabs[active_tab], "New tab opened.\n\n");
+                if (use_process_mode && start_process_tab(&tabs[active_tab]) == -1) { tab_count--; active_tab=tab_count-1; append_output(&tabs[active_tab], "terminator: could not start tab process\n"); }
+                if (use_thread_mode && start_thread_tab(&tabs[active_tab]) == -1) { tab_count--; active_tab=tab_count-1; append_output(&tabs[active_tab], "terminator: could not start tab thread\n"); }
+            }
+        } else if ((key_event->state & ControlMask) &&
+                   (key == XK_w || key == XK_W)) {
+            if (tab_count > 1) {
+                if (use_process_mode) stop_process_tab(&tabs[active_tab]);
+                if (use_thread_mode) stop_thread_tab(&tabs[active_tab]);
+                for (int i = active_tab; i < tab_count - 1; i++) {
+                    tabs[i] = tabs[i + 1];
+                }
+
+                tab_count--;
+
+                if (active_tab >= tab_count) {
+                    active_tab = tab_count - 1;
+                }
+            } else {
+                running = 0;
+            }
+        } else if (key == XK_F5) {
+            if (background_image_change() == -1) {
+                append_output(&tabs[active_tab],
+                              "terminator: no other loadable XPM background found\n");
+            } else {
+                draw_window();
+                XFlush(display);
+            }
+        } else if (key >= XK_F1 && key <= XK_F4) {
+            int selected = (int)(key - XK_F1);
+            if (selected < tab_count) {
+                active_tab = selected;
+            }
+        } else if (key == XK_Return || key == XK_KP_Enter) {
+            if (use_process_mode || use_thread_mode) {
+                if (tab->command_fd >= 0) { char line[INPUT_SIZE+2]; int n=snprintf(line,sizeof(line),"%s\n",tab->input); if (n>0 && write_all_fd(tab->command_fd,line,(size_t)n)==-1) append_output(tab,"terminator: failed to send command to tab worker\n"); }
+                tab->input_length=0; tab->input[0]='\0';
+            } else execute_command(tab);
+        } else if (key == XK_BackSpace) {
+            if (tab->input_length > 0) {
+                tab->input_length--;
+                tab->input[tab->input_length] = '\0';
+            }
+        } else if (key == XK_Escape) {
+            tab->input_length = 0;
+            tab->input[0] = '\0';
+        } else if (length > 0 &&
+                   text[0] >= 32 && text[0] <= 126) {
+            if (tab->input_length < INPUT_SIZE - 1) {
+                tab->input[tab->input_length++] = text[0];
+                tab->input[tab->input_length] = '\0';
+            }
+        }
+
         draw_window();
     }
-    if (proc_mode) for (int i = 0; i < tab_count; i++) stop_process_tab(&tabs[i]);
-    XCloseDisplay(dpy);
+
+    if (wallpaper_picture != None) {
+        XRenderFreePicture(display, wallpaper_picture);
+    }
+
+    if (window_picture != None) {
+        XRenderFreePicture(display, window_picture);
+    }
+
+    if (wallpaper != None) {
+        XFreePixmap(display, wallpaper);
+    }
+
+    XFreeGC(display, gc);
+
+    if (xft_font != NULL) XftFontClose(display, xft_font);
+    if (xft_draw != NULL) XftDrawDestroy(xft_draw);
+
+    XCloseDisplay(display);
     return 0;
 }
