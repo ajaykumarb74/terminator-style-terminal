@@ -147,9 +147,7 @@ static int load_wallpaper(const char *path) {
             display, window, format, 0, NULL);
     }
 
-    if (use_process_mode) for (int i=0;i<tab_count;i++) stop_process_tab(&tabs[i]);
-    if (use_thread_mode) for (int i=0;i<tab_count;i++) stop_thread_tab(&tabs[i]);
-
+    /* Wallpaper replacement must not stop shell workers or close tab pipes. */
     if (wallpaper_picture != None) {
         XRenderFreePicture(display, wallpaper_picture);
     }
